@@ -122,6 +122,13 @@ fastmcp>=2.0,<3  # FastMCP for MCP server (internal + external access)
 pgvector  # PostgreSQL vector extension for semantic search
 
 # =============================================================================
+# PowerPoint & Document Generation (Opportunity Quoter workflow)
+# =============================================================================
+python-pptx  # PowerPoint generation
+beautifulsoup4  # HTML parsing for web enrichment
+Pillow  # Image validation/conversion
+
+# =============================================================================
 # Development
 # =============================================================================
 debugpy  # Remote debugging (VS Code attach)

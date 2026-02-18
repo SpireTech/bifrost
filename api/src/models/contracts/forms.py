@@ -279,6 +279,7 @@ class FormPublic(BaseModel):
                     multiple=field.multiple,
                     max_size_mb=field.max_size_mb,
                     content=field.content,
+                    allow_as_query_param=field.allow_as_query_param,
                     auto_fill=field.auto_fill,
                 )
                 form_fields.append(form_field)

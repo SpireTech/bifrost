@@ -30,6 +30,7 @@ from sqlalchemy import select
 from src.core.database import get_db_context
 from src.models.orm.file_index import FileIndex
 from src.services.file_storage import FileStorageService
+from src.services.repo_storage import RepoStorage
 from src.services.mcp_server.tool_result import (
     error_result,
     format_diff,
@@ -149,32 +150,11 @@ def _find_match_locations(content: str, search_string: str) -> list[dict[str, An
 
 
 async def _read_from_cache_or_s3(path: str) -> str | None:
-    """
-    Load file content from Redis cache -> S3 _repo/ fallback.
+    """Load file content via Redis→S3 cache chain."""
+    from src.core.module_cache import get_module
 
-    file_index is search-only; all code reads go through this path.
-    Returns content string or None if not found.
-    """
-    # Try Redis cache first (async)
-    try:
-        from src.core.module_cache import get_module
-        cached = await get_module(path)
-        if cached:
-            return cached["content"]
-    except Exception as e:
-        logger.debug(f"Redis cache miss for {path}: {e}")
-
-    # Fall back to S3 _repo/
-    try:
-        from src.services.repo_storage import RepoStorage
-        repo = RepoStorage()
-        content_bytes = await repo.read(path)
-        return content_bytes.decode("utf-8")
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        logger.warning(f"S3 read failed for {path}: {e}")
-        return None
+    cached = await get_module(path)
+    return cached["content"] if cached else None
 
 
 async def _get_content_by_path(
@@ -296,14 +276,9 @@ async def list_content(
     logger.info(f"MCP list_content: path_prefix={path_prefix}")
 
     try:
-        async with get_db_context() as db:
-            query = select(FileIndex.path).order_by(FileIndex.path)
-
-            if path_prefix:
-                query = query.where(FileIndex.path.startswith(path_prefix))
-
-            result = await db.execute(query)
-            files = [{"path": row[0]} for row in result.fetchall()]
+        repo = RepoStorage()
+        paths = await repo.list(path_prefix or "")
+        files = [{"path": p} for p in sorted(paths)]
 
         if not files:
             display = "No files found"
@@ -717,15 +692,10 @@ async def delete_content(
 
     try:
         async with get_db_context() as db:
-            # Verify file exists before deleting
-            fi_result = await db.execute(
-                select(FileIndex.path).where(FileIndex.path == path)
-            )
-            if fi_result.scalar_one_or_none() is None:
-                # Also check S3 as a fallback (file might not be indexed yet)
-                content = await _read_from_cache_or_s3(path)
-                if content is None:
-                    return error_result(f"File not found: {path}")
+            # Verify file exists in S3 before deleting
+            repo = RepoStorage()
+            if not await repo.exists(path):
+                return error_result(f"File not found: {path}")
 
             # Use FileStorageService.delete_file() for all deletions
             # It handles: S3 cleanup, file_index cleanup, app pubsub,

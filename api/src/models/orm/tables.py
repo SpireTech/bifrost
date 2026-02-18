@@ -40,7 +40,7 @@ class Table(Base):
         ForeignKey("organizations.id", ondelete="CASCADE"), default=None
     )
     application_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("applications.id", ondelete="SET NULL"), default=None
+        ForeignKey("applications.id", ondelete="SET NULL", onupdate="CASCADE"), default=None
     )
     schema: Mapped[dict | None] = mapped_column(JSONB, default=None)
     description: Mapped[str | None] = mapped_column(Text, default=None)
@@ -88,7 +88,7 @@ class Document(Base):
         String(255), primary_key=True, default=lambda: str(uuid4())
     )
     table_id: Mapped[UUID] = mapped_column(
-        ForeignKey("tables.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("tables.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False
     )
     data: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

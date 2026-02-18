@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import delete, distinct, func, or_, select, union_all
 
 # Import existing Pydantic models for API compatibility
+from src.models.enums import ExecutionStatus
 from src.models import (
     AssignRolesToWorkflowRequest,
     CompatibleReplacement,
@@ -224,7 +225,6 @@ async def _get_app_workflow_ids(db: DbSession, app_id: UUID) -> set[UUID]:
     fi_result = await db.execute(
         select(FileIndex.content).where(
             FileIndex.path.startswith(prefix),
-            ~FileIndex.path.endswith("/app.json"),
         )
     )
 
@@ -607,7 +607,6 @@ async def get_workflow_usage_stats(
             fi_result = await db.execute(
                 select(FileIndex.content).where(
                     FileIndex.path.startswith(prefix),
-                    ~FileIndex.path.endswith("/app.json"),
                 )
             )
             all_refs: set[str] = set()
@@ -802,6 +801,11 @@ async def execute_workflow(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Either workflow_id or code must be provided",
             )
+
+        # If the result already has a terminal status (sync mode), mark as transient
+        # so the frontend uses the inline result instead of waiting on WebSocket
+        if result.status and result.status not in (ExecutionStatus.PENDING, ExecutionStatus.RUNNING):
+            result.is_transient = True
 
         # Publish execution update via WebSocket
         if not request.transient and result.execution_id:
@@ -1386,13 +1390,10 @@ async def recreate_workflow_file(
         # Get the workflow and mark as not orphaned
         workflow = await orphan_service.recreate_file(workflow_id)
 
-        # Load code from file_index
-        from sqlalchemy import select as sa_select
-        from src.models.orm.file_index import FileIndex
-        fi_result = await db.execute(
-            sa_select(FileIndex.content).where(FileIndex.path == workflow.path)
-        )
-        code_content = fi_result.scalar_one_or_none()
+        # Load code via Redis→S3 cache chain
+        from src.core.module_cache import get_module
+        cached = await get_module(workflow.path)
+        code_content = cached["content"] if cached else None
 
         if not code_content:
             raise HTTPException(

@@ -76,6 +76,7 @@ class UserBase(BaseModel):
     is_superuser: bool = Field(default=False)
     is_verified: bool = Field(default=False)
     is_registered: bool = Field(default=True)
+    is_system: bool = Field(default=False)
     mfa_enabled: bool = Field(default=False)
 
 
@@ -168,7 +169,7 @@ class RoleCreate(RoleBase):
 
     Roles are globally defined - org scoping happens at the entity level.
     """
-    pass
+    permissions: dict | None = Field(default=None)
 
 
 class RoleUpdate(BaseModel):
@@ -176,6 +177,7 @@ class RoleUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     is_active: bool | None = None
+    permissions: dict | None = Field(default=None)
 
 
 class RolePublic(RoleBase):

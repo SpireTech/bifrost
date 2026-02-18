@@ -1,6 +1,8 @@
 """Tests for repo storage service."""
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from src.services.repo_storage import RepoStorage
 
 
 @pytest.fixture
@@ -79,3 +81,138 @@ def test_compute_hash():
     from src.services.repo_storage import RepoStorage
     h = RepoStorage.compute_hash(b"hello world")
     assert len(h) == 64  # SHA-256 hex
+
+
+def _mock_settings():
+    s = MagicMock()
+    s.s3_bucket = "test-bucket"
+    s.s3_endpoint_url = "http://localhost:9000"
+    s.s3_access_key = "test"
+    s.s3_secret_key = "test"
+    s.s3_region = "us-east-1"
+    return s
+
+
+class TestListDirectory:
+    """Test RepoStorage.list_directory() using S3 Delimiter."""
+
+    @pytest.mark.asyncio
+    async def test_list_directory_returns_files_and_folders(self):
+        """Non-recursive list returns direct files and folder prefixes from S3."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        s3_files = ["file_at_root.py"]
+        s3_folders = ["apps/", "workflows/"]
+
+        with patch.object(
+            repo, "_list_directory_from_s3",
+            new_callable=AsyncMock, return_value=(s3_files, s3_folders),
+        ):
+            files, folders = await repo.list_directory("")
+
+        assert sorted(files) == ["file_at_root.py"]
+        assert sorted(folders) == ["apps/", "workflows/"]
+
+    @pytest.mark.asyncio
+    async def test_list_directory_with_prefix(self):
+        """List directory scoped to a prefix."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        s3_files = ["apps/myapp/_layout.tsx"]
+        s3_folders = ["apps/myapp/components/", "apps/myapp/pages/"]
+
+        with patch.object(
+            repo, "_list_directory_from_s3",
+            new_callable=AsyncMock, return_value=(s3_files, s3_folders),
+        ):
+            files, folders = await repo.list_directory("apps/myapp/")
+
+        assert sorted(files) == ["apps/myapp/_layout.tsx"]
+        assert sorted(folders) == ["apps/myapp/components/", "apps/myapp/pages/"]
+
+    @pytest.mark.asyncio
+    async def test_list_directory_excludes_system_files(self):
+        """Excluded paths (.git, __pycache__) are filtered out."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        s3_files = ["__pycache__/test.cpython-312.pyc", ".git/config"]
+        s3_folders = ["workflows/"]
+
+        with patch.object(
+            repo, "_list_directory_from_s3",
+            new_callable=AsyncMock, return_value=(s3_files, s3_folders),
+        ):
+            files, folders = await repo.list_directory("")
+
+        assert files == []
+        assert folders == ["workflows/"]
+
+    @pytest.mark.asyncio
+    async def test_list_directory_empty(self):
+        """Empty directory returns empty lists."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        with patch.object(
+            repo, "_list_directory_from_s3",
+            new_callable=AsyncMock, return_value=([], []),
+        ):
+            files, folders = await repo.list_directory("")
+
+        assert files == []
+        assert folders == []
+
+
+class TestListDirectoryFromS3:
+    """Test _list_directory_from_s3 handles S3 Delimiter response correctly."""
+
+    @pytest.mark.asyncio
+    async def test_parses_contents_and_common_prefixes(self):
+        """S3 Contents become files, CommonPrefixes become folders."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        mock_client = AsyncMock()
+        mock_client.list_objects_v2 = AsyncMock(return_value={
+            "Contents": [
+                {"Key": "_repo/file_at_root.py"},
+            ],
+            "CommonPrefixes": [
+                {"Prefix": "_repo/apps/"},
+                {"Prefix": "_repo/workflows/"},
+            ],
+            "IsTruncated": False,
+        })
+
+        files, folders = await repo._list_directory_from_s3(mock_client, "")
+
+        assert files == ["file_at_root.py"]
+        assert folders == ["apps/", "workflows/"]
+        mock_client.list_objects_v2.assert_called_once()
+        call_kwargs = mock_client.list_objects_v2.call_args[1]
+        assert call_kwargs["Delimiter"] == "/"
+        assert call_kwargs["Prefix"] == "_repo/"
+
+    @pytest.mark.asyncio
+    async def test_paginates_with_delimiter(self):
+        """Paginated S3 response accumulates files and folders across pages."""
+        repo = RepoStorage(settings=_mock_settings())
+
+        mock_client = AsyncMock()
+        mock_client.list_objects_v2 = AsyncMock(side_effect=[
+            {
+                "Contents": [{"Key": "_repo/a.py"}],
+                "CommonPrefixes": [{"Prefix": "_repo/dir1/"}],
+                "IsTruncated": True,
+                "NextContinuationToken": "token123",
+            },
+            {
+                "Contents": [{"Key": "_repo/b.py"}],
+                "CommonPrefixes": [{"Prefix": "_repo/dir2/"}],
+                "IsTruncated": False,
+            },
+        ])
+
+        files, folders = await repo._list_directory_from_s3(mock_client, "")
+
+        assert files == ["a.py", "b.py"]
+        assert folders == ["dir1/", "dir2/"]
+        assert mock_client.list_objects_v2.call_count == 2

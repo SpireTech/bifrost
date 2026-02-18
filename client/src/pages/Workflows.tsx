@@ -255,7 +255,7 @@ export function Workflows() {
 	};
 
 	return (
-		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6">
+		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6 max-w-7xl mx-auto">
 			<div className="flex items-center justify-between">
 				<div>
 					<div className="flex items-center gap-3">
@@ -312,6 +312,7 @@ export function Workflows() {
 						variant="outline"
 						size="icon"
 						onClick={() => refetch()}
+						aria-label="Refresh"
 					>
 						<RefreshCw className="h-4 w-4" />
 					</Button>
@@ -324,7 +325,7 @@ export function Workflows() {
 					value={searchTerm}
 					onChange={setSearchTerm}
 					placeholder="Search by name, description, or category..."
-					className="w-64"
+					className="flex-1"
 				/>
 				{isPlatformAdmin && (
 					<div className="w-64">
@@ -394,7 +395,7 @@ export function Workflows() {
 				<div className="flex-1 min-w-0 overflow-auto">
 					{isLoading ? (
 						viewMode === "grid" ? (
-							<div className={`grid gap-4 ${sidebarOpen ? "lg:grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3" : "lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"}`}>
+							<div className={"grid gap-4 grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"}>
 								{[...Array(6)].map((_, i) => (
 									<Skeleton key={i} className="h-56 w-full" />
 								))}
@@ -408,7 +409,7 @@ export function Workflows() {
 						)
 					) : filteredWorkflows.length > 0 ? (
 						viewMode === "grid" ? (
-							<div className={`grid gap-4 ${sidebarOpen ? "lg:grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3" : "lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"}`}>
+							<div className={"grid gap-4 grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"}>
 								{filteredWorkflows.map((workflow) => (
 									<Card
 										key={workflow.id ?? workflow.name}
@@ -658,20 +659,13 @@ export function Workflows() {
 									<DataTableHeader>
 										<DataTableRow>
 											{isPlatformAdmin && (
-												<DataTableHead>
+												<DataTableHead className="w-0 whitespace-nowrap">
 													Organization
 												</DataTableHead>
 											)}
 											<DataTableHead>Name</DataTableHead>
 											<DataTableHead>Description</DataTableHead>
-											<DataTableHead className="text-right">
-												Parameters
-											</DataTableHead>
-											{isPlatformAdmin && (
-												<DataTableHead>Access</DataTableHead>
-											)}
-											<DataTableHead>Status</DataTableHead>
-											<DataTableHead className="text-right">
+											<DataTableHead className="w-0 whitespace-nowrap text-right">
 												<span className="sr-only">Actions</span>
 											</DataTableHead>
 										</DataTableRow>
@@ -680,7 +674,7 @@ export function Workflows() {
 										{filteredWorkflows.map((workflow) => (
 											<DataTableRow key={workflow.id ?? workflow.name}>
 												{isPlatformAdmin && (
-													<DataTableCell>
+													<DataTableCell className="w-0 whitespace-nowrap">
 														{workflow.organization_id ? (
 															<Badge
 																variant="outline"
@@ -702,178 +696,43 @@ export function Workflows() {
 														)}
 													</DataTableCell>
 												)}
-												<DataTableCell className="font-mono font-medium break-all max-w-xs">
+												<DataTableCell className="font-mono font-medium">
 													{workflow.name}
 												</DataTableCell>
-												<DataTableCell className="max-w-xs break-words text-muted-foreground">
+												<DataTableCell className="max-w-xs truncate text-muted-foreground">
 													{workflow.description || (
 														<span className="italic">
 															No description
 														</span>
 													)}
 												</DataTableCell>
-												<DataTableCell className="text-right">
-													{workflow.parameters?.length ?? 0}
-												</DataTableCell>
-												{isPlatformAdmin && (
-													<DataTableCell>
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Badge
-																	variant={
-																		workflow.access_level === "authenticated"
-																			? "secondary"
-																			: "outline"
-																	}
-																	className="text-xs cursor-help"
-																>
-																	{workflow.access_level === "authenticated" ? (
-																		<>
-																			<Users className="mr-1 h-2 w-2" />
-																			Auth
-																		</>
-																	) : (
-																		<>
-																			<Shield className="mr-1 h-2 w-2" />
-																			Roles
-																		</>
-																	)}
-																</Badge>
-															</TooltipTrigger>
-															<TooltipContent>
-																{workflow.access_level === "authenticated"
-																	? "Any authenticated user can execute"
-																	: "Role-based access required"}
-															</TooltipContent>
-														</Tooltip>
-													</DataTableCell>
-												)}
-												<DataTableCell>
-													<div className="flex items-center gap-1">
-														{workflow.is_orphaned && (
-															<Badge
-																variant="outline"
-																className="bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300 cursor-pointer hover:bg-yellow-200 dark:hover:bg-yellow-800 text-xs"
-																title="This workflow's file no longer exists. Click to resolve."
-																onClick={() =>
-																	handleOpenOrphanedDialog(
-																		workflow,
-																	)
-																}
-															>
-																<Unlink className="mr-1 h-2 w-2" />
-																Orphaned
-															</Badge>
-														)}
-														{workflow.type === "tool" && (
-															<Badge
-																variant="secondary"
-																className="bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300 text-xs"
-																title={
-																	workflow.tool_description ||
-																	"Available as AI tool"
-																}
-															>
-																<Bot className="mr-1 h-2 w-2" />
-																Tool
-															</Badge>
-														)}
-														{workflow.type ===
-															"data_provider" && (
-															<Badge
-																variant="secondary"
-																className="bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 text-xs"
-																title="Provides data for forms and apps"
-															>
-																<Database className="mr-1 h-2 w-2" />
-																Data Provider
-															</Badge>
-														)}
-														{workflow.endpoint_enabled && (
-															<Badge
-																variant={
-																	workflow.public_endpoint
-																		? "destructive"
-																		: hasGlobalKey ||
-																			  workflowsWithKeys.has(
-																					workflow.name ??
-																						"",
-																			  )
-																			? "default"
-																			: "outline"
-																}
-																className={`cursor-pointer transition-colors text-xs ${
-																	workflow.public_endpoint
-																		? "bg-orange-600 hover:bg-orange-700 border-orange-600"
-																		: hasGlobalKey ||
-																			  workflowsWithKeys.has(
-																					workflow.name ??
-																						"",
-																			  )
-																			? "bg-green-600 hover:bg-green-700"
-																			: "text-muted-foreground hover:bg-accent"
-																}`}
-																onClick={() =>
-																	handleShowWebhook(
-																		workflow,
-																	)
-																}
-															>
-																{workflow.public_endpoint ? (
-																	<AlertTriangle className="mr-1 h-2 w-2" />
-																) : (
-																	<Webhook className="mr-1 h-2 w-2" />
-																)}
-																Endpoint
-															</Badge>
-														)}
-														{workflow.category && (
-															<Badge
-																variant="secondary"
-																className="text-xs"
-															>
-																{workflow.category}
-															</Badge>
-														)}
-													</div>
-												</DataTableCell>
-												<DataTableCell className="text-right">
+												<DataTableCell className="w-0 whitespace-nowrap text-right">
 													<div className="flex items-center justify-end gap-1">
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Button
-																	variant="outline"
-																	size="sm"
-																	onClick={() => navigate(`/history?workflow=${workflow.id ?? ""}`)}
-																	title="View history"
-																>
-																	<History className="h-4 w-4" />
-																</Button>
-															</TooltipTrigger>
-															<TooltipContent>View history</TooltipContent>
-														</Tooltip>
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Button
-																	variant="outline"
-																	size="sm"
-																	onClick={() => handleOpenInEditor(workflow)}
-																	disabled={openingWorkflowId === (workflow.id ?? workflow.name)}
-																	title="Open in editor"
-																>
-																	{openingWorkflowId === (workflow.id ?? workflow.name) ? (
-																		<Loader2 className="h-4 w-4 animate-spin" />
-																	) : (
-																		<Code2 className="h-4 w-4" />
-																	)}
-																</Button>
-															</TooltipTrigger>
-															<TooltipContent>Open in editor</TooltipContent>
-														</Tooltip>
+														<Button
+															variant="outline"
+															size="icon-sm"
+															onClick={() => navigate(`/history?workflow=${workflow.id ?? ""}`)}
+															title="View history"
+														>
+															<History className="h-4 w-4" />
+														</Button>
+														<Button
+															variant="outline"
+															size="icon-sm"
+															onClick={() => handleOpenInEditor(workflow)}
+															disabled={openingWorkflowId === (workflow.id ?? workflow.name)}
+															title="Open in editor"
+														>
+															{openingWorkflowId === (workflow.id ?? workflow.name) ? (
+																<Loader2 className="h-4 w-4 animate-spin" />
+															) : (
+																<Code2 className="h-4 w-4" />
+															)}
+														</Button>
 														{isPlatformAdmin && (
 															<Button
-																variant="outline"
-																size="sm"
+																variant="ghost"
+																size="icon-sm"
 																onClick={() =>
 																	handleEditWorkflow(workflow)
 																}
@@ -884,12 +743,13 @@ export function Workflows() {
 														)}
 														<Button
 															variant="outline"
-															size="sm"
+															size="icon-sm"
 															onClick={() =>
 																handleExecute(
 																	workflow.name ?? "",
 																)
 															}
+															title="Execute"
 														>
 															<PlayCircle className="h-4 w-4" />
 														</Button>
@@ -915,6 +775,16 @@ export function Workflows() {
 										? "Try adjusting your search term or clear the filter"
 										: "No workflows have been registered in the workflow engine"}
 								</p>
+								{!searchTerm && (
+									<Button
+										variant="outline"
+										onClick={() => openEditor()}
+										className="mt-4"
+									>
+										<Code className="mr-2 h-4 w-4" />
+										Open editor
+									</Button>
+								)}
 							</CardContent>
 						</Card>
 					)}

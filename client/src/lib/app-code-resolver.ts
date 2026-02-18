@@ -87,12 +87,17 @@ export async function resolveFile(
  * ```
  */
 export function extractComponentNames(source: string): string[] {
-	// Match JSX opening tags with PascalCase names
-	// e.g., <ComponentName, <Card>, <MyComponent123>
-	const matches = source.matchAll(/<([A-Z][a-zA-Z0-9]*)/g);
 	const names = new Set<string>();
 
-	for (const match of matches) {
+	// Match JSX opening tags: <ComponentName, <Card>, <MyComponent123>
+	for (const match of source.matchAll(/<([A-Z][a-zA-Z0-9]*)/g)) {
+		names.add(match[1]);
+	}
+
+	// Match compiled createElement calls: React.createElement(ComponentName, ...)
+	for (const match of source.matchAll(
+		/React\.createElement\(([A-Z][a-zA-Z0-9]*)/g,
+	)) {
 		names.add(match[1]);
 	}
 
@@ -192,6 +197,10 @@ export async function resolveAppComponentsFromFiles(
 	appId: string,
 	componentNames: string[],
 	userComponentNames: Set<string>,
+	/** Pre-loaded files from /render — avoids per-component API calls */
+	allFiles?: AppCodeFile[],
+	/** Loaded external npm dependencies keyed by package name */
+	externalDeps: Record<string, Record<string, unknown>> = {},
 ): Promise<Record<string, React.ComponentType>> {
 	const components: Record<string, React.ComponentType> = {};
 
@@ -210,19 +219,39 @@ export async function resolveAppComponentsFromFiles(
 			continue;
 		}
 
-		// Fetch from API - try with .tsx extension first, then without
-		let file = await resolveFile(appId, `components/${name}.tsx`);
-		if (!file) {
-			file = await resolveFile(appId, `components/${name}`);
+		let source: string | null = null;
+		let isPreCompiled = false;
+
+		if (allFiles) {
+			// Resolve from in-memory file list (no API call)
+			const match = allFiles.find(
+				(f) =>
+					f.path === `components/${name}.tsx` ||
+					f.path === `components/${name}.ts` ||
+					f.path === `components/${name}`,
+			);
+			if (match) {
+				source = match.compiled || match.source;
+				isPreCompiled = !!match.compiled;
+			}
+		} else {
+			// Fallback: fetch from API individually
+			let file = await resolveFile(appId, `components/${name}.tsx`);
+			if (!file) {
+				file = await resolveFile(appId, `components/${name}`);
+			}
+			if (file) {
+				source = (file as AppCodeFile).compiled || file.source;
+				isPreCompiled = !!(file as AppCodeFile).compiled;
+			}
 		}
-		if (!file) {
-			// This shouldn't happen since we filtered to known files
+
+		if (!source) {
 			console.warn(`Component file not found (unexpected): ${name}`);
 			continue;
 		}
 
-		// Compilation is 100% client-side now
-		const component = createComponent(file.source, {}, false);
+		const component = createComponent(source, {}, isPreCompiled, externalDeps);
 
 		// Cache the compiled component
 		componentCache.set(cacheKey, {

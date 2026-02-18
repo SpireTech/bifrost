@@ -284,6 +284,7 @@ class SimpleFileResponse(BaseModel):
 
     path: str = Field(description="Relative file path within the app (e.g., 'pages/index.tsx')")
     source: str = Field(description="File source content")
+    compiled: str | None = Field(default=None, description="Pre-compiled JavaScript output")
 
 
 class SimpleFileListResponse(BaseModel):
@@ -291,6 +292,60 @@ class SimpleFileListResponse(BaseModel):
 
     files: list[SimpleFileResponse]
     total: int
+
+
+class RenderFileResponse(BaseModel):
+    """Single compiled file for rendering (no source)."""
+
+    path: str = Field(description="Relative file path within the app")
+    code: str = Field(description="Compiled JavaScript ready for execution")
+
+
+class AppRenderResponse(BaseModel):
+    """All compiled files needed to render an application."""
+
+    files: list[RenderFileResponse]
+    total: int
+    dependencies: dict[str, str] = Field(
+        default_factory=dict,
+        description="npm dependencies from app.yaml {name: version} for esm.sh loading",
+    )
+
+
+# ==================== EMBED SECRET MODELS ====================
+
+
+class EmbedSecretCreate(BaseModel):
+    """Request to create an embed secret for an app."""
+
+    name: str = Field(..., max_length=255, description="Label for this secret (e.g., 'Halo Production')")
+    secret: str | None = Field(default=None, description="Shared secret. If omitted, one is auto-generated.")
+
+
+class EmbedSecretResponse(BaseModel):
+    """Embed secret metadata (never includes the raw secret after creation)."""
+
+    id: str
+    name: str
+    is_active: bool
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_dt(self, dt: datetime) -> str:
+        return dt.isoformat()
+
+
+class EmbedSecretCreatedResponse(EmbedSecretResponse):
+    """Response when creating an embed secret — includes raw secret shown once."""
+
+    raw_secret: str
+
+
+class EmbedSecretUpdate(BaseModel):
+    """Request to update an embed secret."""
+
+    is_active: bool | None = None
+    name: str | None = Field(default=None, max_length=255)
 
 
 # ==================== IMPORT MODELS ====================

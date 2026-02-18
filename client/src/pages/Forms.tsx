@@ -60,18 +60,6 @@ import type { components } from "@/lib/v1";
 type FormPublic = components["schemas"]["FormPublic"];
 type Organization = components["schemas"]["OrganizationPublic"];
 
-/**
- * Returns a Tailwind font size class based on title length.
- * Shorter titles get larger fonts; longer titles shrink to fit on one line.
- */
-function getTitleFontSize(title: string): string {
-	const len = title.length;
-	if (len <= 20) return "text-lg"; // ~18px - short titles
-	if (len <= 30) return "text-base"; // ~16px - medium titles
-	if (len <= 40) return "text-sm"; // ~14px - longer titles
-	return "text-xs"; // ~12px - very long titles
-}
-
 export function Forms() {
 	const navigate = useNavigate();
 	const { scope, isGlobalScope } = useOrgScope();
@@ -222,7 +210,7 @@ export function Forms() {
 	]);
 
 	return (
-		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6">
+		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6 max-w-7xl mx-auto">
 			<div className="flex items-center justify-between">
 				<div>
 					<div className="flex items-center gap-3">
@@ -306,7 +294,7 @@ export function Forms() {
 					value={searchTerm}
 					onChange={setSearchTerm}
 					placeholder="Search forms by name, description, or workflow..."
-					className="max-w-md"
+					className="flex-1"
 				/>
 				{isPlatformAdmin && (
 					<div className="w-64">
@@ -323,7 +311,7 @@ export function Forms() {
 
 			{isLoading ? (
 				viewMode === "grid" || !canManageForms ? (
-					<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+					<div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
 						{[...Array(6)].map((_, i) => (
 							<Skeleton key={i} className="h-48 w-full" />
 						))}
@@ -337,49 +325,19 @@ export function Forms() {
 				)
 			) : filteredForms && filteredForms.length > 0 ? (
 				viewMode === "grid" || !canManageForms ? (
-					<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+					<div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
 						{filteredForms.map((form) => (
 							<Card
 								key={form.id}
 								className="hover:border-primary transition-colors flex flex-col"
 							>
 								<CardHeader className="pb-3">
-									{/* Title row with toggle */}
-									<div className="flex items-center justify-between gap-2">
-										<CardTitle
-											className={`${getTitleFontSize(form.name)} truncate`}
-											title={form.name}
-										>
-											{form.name}
-										</CardTitle>
-										{canManageForms && (
-											<Tooltip>
-												<TooltipTrigger asChild>
-													<div className="shrink-0">
-														<Switch
-															checked={
-																form.is_active
-															}
-															onCheckedChange={() =>
-																handleToggleActive(
-																	form.id,
-																	form.name,
-																	form.is_active,
-																)
-															}
-															id={`form-active-${form.id}`}
-														/>
-													</div>
-												</TooltipTrigger>
-												<TooltipContent>
-													{form.is_active
-														? "Enabled - click to disable"
-														: "Disabled - click to enable"}
-												</TooltipContent>
-											</Tooltip>
-										)}
-									</div>
-									{/* Invalid badge on its own line if needed */}
+									<CardTitle
+										className="text-base truncate"
+										title={form.name}
+									>
+										{form.name}
+									</CardTitle>
 									{!formValidation.get(form.id)?.valid &&
 										canManageForms && (
 											<Badge
@@ -390,7 +348,6 @@ export function Forms() {
 												Invalid
 											</Badge>
 										)}
-									{/* Description */}
 									<CardDescription className="mt-1.5 text-sm line-clamp-2">
 										{form.description || (
 											<span className="italic text-muted-foreground/60">
@@ -454,7 +411,7 @@ export function Forms() {
 									)}
 
 									{/* Action buttons */}
-									<div className="flex gap-2">
+									<div className="flex items-center gap-2">
 										<Button
 											className="flex-1"
 											onClick={() =>
@@ -505,6 +462,30 @@ export function Forms() {
 												>
 													<Trash2 className="h-4 w-4" />
 												</Button>
+												<Tooltip>
+													<TooltipTrigger asChild>
+														<div className="shrink-0 ml-auto">
+															<Switch
+																checked={
+																	form.is_active
+																}
+																onCheckedChange={() =>
+																	handleToggleActive(
+																		form.id,
+																		form.name,
+																		form.is_active,
+																	)
+																}
+																id={`form-active-${form.id}`}
+															/>
+														</div>
+													</TooltipTrigger>
+													<TooltipContent>
+														{form.is_active
+															? "Enabled - click to disable"
+															: "Disabled - click to enable"}
+													</TooltipContent>
+												</Tooltip>
 											</>
 										)}
 									</div>
@@ -518,14 +499,14 @@ export function Forms() {
 							<DataTableHeader>
 								<DataTableRow>
 									{isPlatformAdmin && (
-										<DataTableHead>
+										<DataTableHead className="w-0 whitespace-nowrap">
 											Organization
 										</DataTableHead>
 									)}
 									<DataTableHead>Name</DataTableHead>
 									<DataTableHead>Description</DataTableHead>
-									<DataTableHead>Status</DataTableHead>
-									<DataTableHead className="text-right" />
+									<DataTableHead className="w-0 whitespace-nowrap">Status</DataTableHead>
+									<DataTableHead className="w-0 whitespace-nowrap text-right" />
 								</DataTableRow>
 							</DataTableHeader>
 							<DataTableBody>
@@ -536,7 +517,7 @@ export function Forms() {
 									return (
 										<DataTableRow key={form.id}>
 											{isPlatformAdmin && (
-												<DataTableCell>
+												<DataTableCell className="w-0 whitespace-nowrap">
 													{form.organization_id ? (
 														<Badge
 															variant="outline"
@@ -558,17 +539,17 @@ export function Forms() {
 													)}
 												</DataTableCell>
 											)}
-											<DataTableCell className="font-medium break-all max-w-xs">
+											<DataTableCell className="font-medium">
 												{form.name}
 											</DataTableCell>
-											<DataTableCell className="max-w-xs break-words text-muted-foreground">
+											<DataTableCell className="max-w-xs truncate text-muted-foreground">
 												{form.description || (
 													<span className="italic">
 														No description
 													</span>
 												)}
 											</DataTableCell>
-											<DataTableCell>
+											<DataTableCell className="w-0 whitespace-nowrap">
 												{canManageForms ? (
 													<Tooltip>
 														<TooltipTrigger asChild>
@@ -608,7 +589,7 @@ export function Forms() {
 													</Badge>
 												)}
 											</DataTableCell>
-											<DataTableCell className="text-right">
+											<DataTableCell className="w-0 whitespace-nowrap text-right">
 												<div className="flex gap-1 justify-end">
 													<Button
 														size="sm"

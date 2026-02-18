@@ -27,6 +27,7 @@ from .indexers.agent import _serialize_agent_to_yaml
 from .entity_detector import detect_platform_entity_type
 
 if TYPE_CHECKING:
+    from src.models.orm.applications import Application
     from .diagnostics import DiagnosticsService
     from .deactivation import DeactivationProtectionService
 
@@ -141,11 +142,12 @@ class FileOperationsService:
                 return _serialize_agent_to_yaml(agent), None
             raise FileNotFoundError(f"Agent not found: {agent_id}")
 
-        # Everything else: Redis cache → S3 _repo/ (file_index is search-only)
-        from src.core.module_cache import get_module
-        cached = await get_module(path)
-        if cached:
-            return cached["content"].encode("utf-8"), None
+        # Python modules: Redis cache → S3 fallback (for fast worker imports)
+        if path.endswith(".py"):
+            from src.core.module_cache import get_module
+            cached = await get_module(path)
+            if cached:
+                return cached["content"].encode("utf-8"), None
 
         # Fallback to S3 _repo/ prefix
         s3_key = f"{REPO_PREFIX}{path}"
@@ -311,36 +313,43 @@ class FileOperationsService:
                 logger.warning(f"Failed to clear diagnostic notification for {path}: {e}")
 
         # App files: fire pubsub for real-time preview
-        if path.startswith("apps/"):
-            parts = path.split("/")
-            if len(parts) >= 2:
-                slug = parts[1]
-                try:
-                    from src.models.orm.applications import Application
-                    app_stmt = select(Application).where(Application.slug == slug)
-                    app_result = await self.db.execute(app_stmt)
-                    app = app_result.scalar_one_or_none()
-                    if app:
-                        from src.core.pubsub import publish_app_code_file_update
-                        # Relative path within app (strip "apps/{slug}/")
-                        relative_path = "/".join(parts[2:]) if len(parts) > 2 else ""
-                        await publish_app_code_file_update(
-                            app_id=str(app.id),
-                            user_id=updated_by,
-                            user_name=updated_by,
-                            path=relative_path,
-                            source=content_str,
-                            compiled=None,
-                            action="update",
-                        )
-                        # Sync to _apps/{app_id}/preview/
-                        from src.services.app_storage import AppStorageService
-                        app_storage = AppStorageService()
-                        await app_storage.write_preview_file(
-                            str(app.id), relative_path, final_content
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to publish app file update for {path}: {e}")
+        app = await self._find_app_by_path(path)
+        if app:
+            try:
+                from src.core.pubsub import publish_app_code_file_update
+                # Derive relative path by stripping the app's repo_path prefix
+                app_prefix = (app.repo_path or f"apps/{app.slug}").rstrip("/") + "/"
+                relative_path = path[len(app_prefix):] if path.startswith(app_prefix) else path
+
+                # Compile TSX/TS files server-side
+                compiled_js = None
+                if relative_path.endswith((".tsx", ".ts")):
+                    from src.services.app_compiler import AppCompilerService
+                    compiler = AppCompilerService()
+                    result = await compiler.compile_file(content_str, relative_path)
+                    if result.success:
+                        compiled_js = result.compiled
+                    else:
+                        logger.warning(f"Compilation failed for {relative_path}: {result.error}")
+
+                await publish_app_code_file_update(
+                    app_id=str(app.id),
+                    user_id=updated_by,
+                    user_name=updated_by,
+                    path=relative_path,
+                    source=content_str,
+                    compiled=compiled_js,
+                    action="update",
+                )
+                # Write compiled JS (or raw source if compile failed) to preview
+                preview_content = compiled_js.encode("utf-8") if compiled_js else final_content
+                from src.services.app_storage import AppStorageService
+                app_storage = AppStorageService()
+                await app_storage.write_preview_file(
+                    str(app.id), relative_path, preview_content
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish app file update for {path}: {e}")
 
         logger.info(f"File written: {path} ({size_bytes} bytes) by {updated_by}")
         return WriteResult(
@@ -356,74 +365,99 @@ class FileOperationsService:
         """
         Delete a file from storage.
 
-        Args:
-            path: Relative path within workspace
+        Pattern: S3 first (source of truth), then conditional side effects.
         """
-        # .bifrost/ files are generated artifacts, not user-editable
         if path.startswith(".bifrost/") or path == ".bifrost":
             raise HTTPException(
                 status_code=403,
                 detail=".bifrost/ files are system-generated and cannot be edited directly",
             )
 
-        # Detect entity type from path (used for module cache invalidation below)
-        platform_entity_type = detect_platform_entity_type(path, b"")
+        # === S3: Source of truth (must succeed) ===
+        await self._delete_from_s3(path)
 
-        # Delete from S3 _repo/ prefix for all files
+        # === Side effects (best-effort, independent) ===
+        for op in (
+            self._remove_from_search_index,
+            self._handle_app_file_cleanup,
+            self._remove_metadata,
+            self._invalidate_module_cache_if_python,
+        ):
+            try:
+                await op(path)
+            except Exception as e:
+                logger.warning(f"Delete side effect failed for {path}: {e}")
+
+        logger.info(f"File deleted: {path}")
+
+    async def _delete_from_s3(self, path: str) -> None:
+        """Delete from S3 _repo/ — source-of-truth operation."""
         s3_key = f"{REPO_PREFIX}{path}"
         async with self._s3_client.get_client() as s3:
-            try:
-                await s3.delete_object(
-                    Bucket=self.settings.s3_bucket,
-                    Key=s3_key,
-                )
-            except Exception:
-                pass  # Ignore S3 errors for idempotency
+            await s3.delete_object(Bucket=self.settings.s3_bucket, Key=s3_key)
 
-        # Delete from file_index
+    async def _remove_from_search_index(self, path: str) -> None:
+        """Remove from file_index search table if present."""
         from sqlalchemy import delete
         del_stmt = delete(FileIndex).where(FileIndex.path == path)
         await self.db.execute(del_stmt)
 
-        # App files: fire pubsub delete event
-        if path.startswith("apps/"):
-            parts = path.split("/")
-            if len(parts) >= 2:
-                slug = parts[1]
-                try:
-                    from src.models.orm.applications import Application
-                    app_stmt = select(Application).where(Application.slug == slug)
-                    app_result = await self.db.execute(app_stmt)
-                    app = app_result.scalar_one_or_none()
-                    if app:
-                        from src.core.pubsub import publish_app_code_file_update
-                        relative_path = "/".join(parts[2:]) if len(parts) > 2 else ""
-                        await publish_app_code_file_update(
-                            app_id=str(app.id),
-                            user_id="system",
-                            user_name="system",
-                            path=relative_path,
-                            source=None,
-                            compiled=None,
-                            action="delete",
-                        )
-                        # Delete from _apps/{app_id}/preview/
-                        from src.services.app_storage import AppStorageService
-                        app_storage = AppStorageService()
-                        await app_storage.delete_preview_file(
-                            str(app.id), relative_path
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to publish app file delete for {path}: {e}")
+    async def _find_app_by_path(self, path: str) -> "Application | None":
+        """Find the Application that owns a file path via repo_path prefix match.
 
-        # Clean up related metadata (workflows, forms, agents)
-        await self._remove_metadata(path)
+        Uses a DB query to find apps whose repo_path is a prefix of the given
+        path, selecting the longest (most specific) match. This supports apps
+        at any repo_path, not just apps/{slug}.
+        """
+        from sqlalchemy import func, text
 
-        # Invalidate module cache
+        from src.models.orm.applications import Application
+
+        # Find the app whose repo_path is the longest prefix of this path.
+        # e.g. path="custom/deep/app/pages/index.tsx" matches repo_path="custom/deep/app"
+        # We append "/" to repo_path so "apps/my" doesn't match "apps/myapp/file.tsx"
+        # Uses starts_with() instead of LIKE to avoid wildcard chars (_, %) in repo_path.
+        stmt = (
+            select(Application)
+            .where(
+                Application.repo_path.isnot(None),
+                text("starts_with(:path, repo_path || '/')").bindparams(path=path),
+            )
+            .order_by(func.length(Application.repo_path).desc())
+            .limit(1)
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def _handle_app_file_cleanup(self, path: str) -> None:
+        """If this file belongs to an app, clean up preview and notify clients."""
+        app = await self._find_app_by_path(path)
+        if not app:
+            return
+
+        app_prefix = (app.repo_path or f"apps/{app.slug}").rstrip("/") + "/"
+        relative_path = path[len(app_prefix):] if path.startswith(app_prefix) else path
+
+        from src.core.pubsub import publish_app_code_file_update
+        await publish_app_code_file_update(
+            app_id=str(app.id),
+            user_id="system",
+            user_name="system",
+            path=relative_path,
+            source=None,
+            compiled=None,
+            action="delete",
+        )
+
+        from src.services.app_storage import AppStorageService
+        app_storage = AppStorageService()
+        await app_storage.delete_preview_file(str(app.id), relative_path)
+
+    async def _invalidate_module_cache_if_python(self, path: str) -> None:
+        """Invalidate Redis module cache for Python files."""
+        platform_entity_type = detect_platform_entity_type(path, b"")
         if platform_entity_type == "module" or path.endswith(".py"):
             await invalidate_module(path)
-
-        logger.info(f"File deleted: {path}")
 
     async def move_file(self, old_path: str, new_path: str) -> None:
         """

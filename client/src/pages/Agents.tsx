@@ -106,9 +106,6 @@ export function Agents() {
 		return org?.name || orgId;
 	};
 
-	// All authenticated users can manage agents (create private ones)
-	const canManageAgents = true;
-
 	// Use agents from API directly (backend handles org filtering)
 	// Cast to extended type that includes organization_id (pending type regeneration)
 	const scopeFilteredAgents = (agents ?? []) as AgentSummary[];
@@ -166,7 +163,7 @@ export function Agents() {
 	};
 
 	return (
-		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6">
+		<div className="h-[calc(100vh-8rem)] flex flex-col space-y-6 max-w-7xl mx-auto">
 			{/* Header */}
 			<div className="flex items-center justify-between">
 				<div>
@@ -194,54 +191,50 @@ export function Agents() {
 						)}
 					</div>
 					<p className="mt-2 text-muted-foreground">
-						{canManageAgents
-							? "Create and manage AI agents with custom prompts and tools"
-							: "View available AI agents"}
+						Create and manage AI agents with custom prompts and tools
 					</p>
 				</div>
 				<div className="flex gap-2">
-					{canManageAgents && (
-						<ToggleGroup
-							type="single"
-							value={viewMode}
-							onValueChange={(value: string) =>
-								value && setViewMode(value as "grid" | "table")
-							}
+					<ToggleGroup
+						type="single"
+						value={viewMode}
+						onValueChange={(value: string) =>
+							value && setViewMode(value as "grid" | "table")
+						}
+					>
+						<ToggleGroupItem
+							value="grid"
+							aria-label="Grid view"
+							size="sm"
 						>
-							<ToggleGroupItem
-								value="grid"
-								aria-label="Grid view"
-								size="sm"
-							>
-								<LayoutGrid className="h-4 w-4" />
-							</ToggleGroupItem>
-							<ToggleGroupItem
-								value="table"
-								aria-label="Table view"
-								size="sm"
-							>
-								<TableIcon className="h-4 w-4" />
-							</ToggleGroupItem>
-						</ToggleGroup>
-					)}
+							<LayoutGrid className="h-4 w-4" />
+						</ToggleGroupItem>
+						<ToggleGroupItem
+							value="table"
+							aria-label="Table view"
+							size="sm"
+						>
+							<TableIcon className="h-4 w-4" />
+						</ToggleGroupItem>
+					</ToggleGroup>
 					<Button
 						variant="outline"
 						size="icon"
 						onClick={() => refetch()}
 						title="Refresh"
+						aria-label="Refresh"
 					>
 						<RefreshCw className="h-4 w-4" />
 					</Button>
-					{canManageAgents && (
-						<Button
-							variant="outline"
-							size="icon"
-							onClick={handleCreate}
-							title="Create Agent"
-						>
-							<Plus className="h-4 w-4" />
-						</Button>
-					)}
+					<Button
+						variant="outline"
+						size="icon"
+						onClick={handleCreate}
+						title="Create Agent"
+						aria-label="Create agent"
+					>
+						<Plus className="h-4 w-4" />
+					</Button>
 				</div>
 			</div>
 
@@ -251,7 +244,7 @@ export function Agents() {
 					value={searchTerm}
 					onChange={setSearchTerm}
 					placeholder="Search agents by name or description..."
-					className="max-w-md"
+					className="flex-1"
 				/>
 				{isPlatformAdmin && (
 					<div className="w-64">
@@ -268,8 +261,8 @@ export function Agents() {
 
 			{/* Content */}
 			{isLoading ? (
-				viewMode === "grid" || !canManageAgents ? (
-					<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+				viewMode === "grid" ? (
+					<div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
 						{[...Array(6)].map((_, i) => (
 							<Skeleton key={i} className="h-48 w-full" />
 						))}
@@ -282,9 +275,9 @@ export function Agents() {
 					</div>
 				)
 			) : filteredAgents && filteredAgents.length > 0 ? (
-				viewMode === "grid" || !canManageAgents ? (
+				viewMode === "grid" ? (
 					// Grid View
-					<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+					<div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
 						{filteredAgents.map((agent) => (
 							<Card
 								key={agent.id}
@@ -307,21 +300,19 @@ export function Agents() {
 												)}
 											</CardDescription>
 										</div>
-										{canManageAgents && (
-											<div className="flex items-center gap-2 shrink-0">
-												<Switch
-													checked={agent.is_active}
-													onCheckedChange={() =>
-														handleToggleActive(
-															agent,
-														)
-													}
-													disabled={
-														updateAgent.isPending
-													}
-												/>
-											</div>
-										)}
+										<div className="flex items-center gap-2 shrink-0">
+											<Switch
+												checked={agent.is_active}
+												onCheckedChange={() =>
+													handleToggleActive(
+														agent,
+													)
+												}
+												disabled={
+													updateAgent.isPending
+												}
+											/>
+										</div>
 									</div>
 								</CardHeader>
 								<CardContent className="pt-0 mt-auto">
@@ -374,8 +365,7 @@ export function Agents() {
 									</div>
 
 									{/* Actions */}
-									{canManageAgents && (
-										<div className="flex gap-2">
+									<div className="flex gap-2">
 											<Button
 												variant="outline"
 												size="sm"
@@ -394,6 +384,7 @@ export function Agents() {
 													agent.id && handleCopyMcpUrl(agent.id)
 												}
 												title="Copy MCP URL"
+												aria-label="Copy MCP URL"
 											>
 												{copiedId === agent.id ? (
 													<Check className="h-3 w-3" />
@@ -407,11 +398,11 @@ export function Agents() {
 												onClick={() =>
 													handleDelete(agent)
 												}
+												aria-label="Delete agent"
 											>
 												<Trash2 className="h-3 w-3" />
 											</Button>
-										</div>
-									)}
+									</div>
 								</CardContent>
 							</Card>
 						))}
@@ -423,22 +414,22 @@ export function Agents() {
 							<DataTableHeader>
 								<DataTableRow>
 									{isPlatformAdmin && (
-										<DataTableHead>
+										<DataTableHead className="w-0 whitespace-nowrap">
 											Organization
 										</DataTableHead>
 									)}
 									<DataTableHead>Name</DataTableHead>
 									<DataTableHead>Description</DataTableHead>
-									<DataTableHead>Channels</DataTableHead>
-									<DataTableHead>Status</DataTableHead>
-									<DataTableHead className="text-right" />
+									<DataTableHead className="w-0 whitespace-nowrap">Channels</DataTableHead>
+									<DataTableHead className="w-0 whitespace-nowrap">Status</DataTableHead>
+									<DataTableHead className="w-0 whitespace-nowrap text-right" />
 								</DataTableRow>
 							</DataTableHeader>
 							<DataTableBody>
 								{filteredAgents.map((agent) => (
 									<DataTableRow key={agent.id}>
 										{isPlatformAdmin && (
-											<DataTableCell>
+											<DataTableCell className="w-0 whitespace-nowrap">
 												{agent.organization_id ? (
 													<Badge
 														variant="outline"
@@ -470,7 +461,7 @@ export function Agents() {
 											{agent.description ||
 												"No description"}
 										</DataTableCell>
-										<DataTableCell>
+										<DataTableCell className="w-0 whitespace-nowrap">
 											<div className="flex flex-wrap gap-1">
 												{agent.channels?.map(
 													(channel) => (
@@ -485,7 +476,7 @@ export function Agents() {
 												)}
 											</div>
 										</DataTableCell>
-										<DataTableCell>
+										<DataTableCell className="w-0 whitespace-nowrap">
 											<Switch
 												checked={agent.is_active}
 												onCheckedChange={() =>
@@ -494,7 +485,7 @@ export function Agents() {
 												disabled={updateAgent.isPending}
 											/>
 										</DataTableCell>
-										<DataTableCell className="text-right">
+										<DataTableCell className="w-0 whitespace-nowrap text-right">
 											<div className="flex justify-end gap-2">
 												<Button
 													variant="ghost"
@@ -502,6 +493,7 @@ export function Agents() {
 													onClick={() =>
 														agent.id && handleEdit(agent.id)
 													}
+													aria-label="Edit agent"
 												>
 													<Pencil className="h-4 w-4" />
 												</Button>
@@ -512,6 +504,7 @@ export function Agents() {
 														agent.id && handleCopyMcpUrl(agent.id)
 													}
 													title="Copy MCP URL"
+													aria-label="Copy MCP URL"
 												>
 													{copiedId === agent.id ? (
 														<Check className="h-4 w-4" />
@@ -525,6 +518,7 @@ export function Agents() {
 													onClick={() =>
 														handleDelete(agent)
 													}
+													aria-label="Delete agent"
 												>
 													<Trash2 className="h-4 w-4" />
 												</Button>
@@ -549,19 +543,16 @@ export function Agents() {
 						<p className="mt-2 text-sm text-muted-foreground">
 							{searchTerm
 								? "Try adjusting your search term or clear the filter"
-								: canManageAgents
-									? "Get started by creating your first AI agent"
-									: "No agents are currently available"}
+								: "Get started by creating your first AI agent"}
 						</p>
-						{canManageAgents && !searchTerm && (
+						{!searchTerm && (
 							<Button
 								variant="outline"
-								size="icon"
 								onClick={handleCreate}
 								className="mt-4"
-								title="Create Agent"
 							>
-								<Plus className="h-4 w-4" />
+								<Plus className="mr-2 h-4 w-4" />
+								Create your first agent
 							</Button>
 						)}
 					</CardContent>

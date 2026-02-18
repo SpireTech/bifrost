@@ -375,8 +375,8 @@ async def get_form(
             detail="Form not found",
         )
 
-    # Check access - admins can see all forms
-    if ctx.user.is_superuser:
+    # Check access - admins and embed users can see all forms
+    if ctx.user.is_superuser or ctx.user.embed:
         return FormPublic.model_validate(form)
 
     # Non-admins can only see active forms
@@ -726,13 +726,14 @@ async def execute_form(
             detail="Form not found",
         )
 
-    # Check access
-    has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
-    if not has_access:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied to this form",
-        )
+    # Check access — embed users are pre-authorized via HMAC
+    if not ctx.user.embed:
+        has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
+        if not has_access:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this form",
+            )
 
     # Form must have a workflow_id
     if not form.workflow_id:
@@ -741,8 +742,9 @@ async def execute_form(
             detail="Form has no workflow configured",
         )
 
-    # Merge default launch params with provided input
-    merged_params = {**(form.default_launch_params or {}), **request.form_data}
+    # Merge: defaults < verified HMAC params < user form input
+    verified_params = ctx.user.verified_params or {}
+    merged_params = {**(form.default_launch_params or {}), **verified_params, **request.form_data}
 
     # Create organization object if org_id is set
     org = None
@@ -773,6 +775,18 @@ async def execute_form(
         )
 
         logger.info(f"Form {form_id} executed by user {ctx.user.email}, execution_id={response.execution_id}")
+
+        # Register execution in Redis for embed session scoping
+        if ctx.user.embed and ctx.user.jti:
+            from src.core.cache.keys import embed_execution_key, TTL_EMBED_EXECUTION
+            from src.core.cache.redis_client import get_redis
+
+            async with get_redis() as r:
+                await r.setex(
+                    embed_execution_key(ctx.user.jti, response.execution_id),
+                    TTL_EMBED_EXECUTION,
+                    "1",
+                )
 
         return response
 
@@ -845,20 +859,22 @@ async def execute_startup_workflow(
             detail="Form not found",
         )
 
-    # Check access
-    has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
-    if not has_access:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied to this form",
-        )
+    # Check access — embed users are pre-authorized via HMAC
+    if not ctx.user.embed:
+        has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
+        if not has_access:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this form",
+            )
 
     # If no launch workflow, return empty result
     if not form.launch_workflow_id:
         return FormStartupResponse(result=None)
 
-    # Merge default launch params with provided input
-    merged_params = {**(form.default_launch_params or {}), **input_data}
+    # Merge: defaults < verified HMAC params < user input
+    verified_params = ctx.user.verified_params or {}
+    merged_params = {**(form.default_launch_params or {}), **verified_params, **input_data}
 
     # Create organization object if org_id is set
     org = None
@@ -1019,13 +1035,14 @@ async def generate_upload_url(
             detail="Form not found",
         )
 
-    # Check access
-    has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
-    if not has_access:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied to this form",
-        )
+    # Check access — embed users are pre-authorized via HMAC
+    if not ctx.user.embed:
+        has_access = await _check_form_access(db, form, ctx.user.user_id, ctx.org_id, ctx.user.is_superuser)
+        if not has_access:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this form",
+            )
 
     # Server-side validation of file constraints if field_name provided
     if request.field_name:

@@ -70,7 +70,17 @@ import {
 	UNSAFE_RouteContext,
 } from "react-router-dom";
 import * as LucideIcons from "lucide-react";
-import { compileAppCode, wrapAsComponent } from "./app-code-compiler";
+/**
+ * Wrap compiled code in a component factory.
+ */
+function wrapAsComponent(compiled: string): string {
+	return `
+    var __defaultExport__;
+    var __exports__ = {};
+    ${compiled}
+    return __defaultExport__;
+  `;
+}
 import { createPlatformScope } from "./app-code-platform/scope";
 
 /**
@@ -172,6 +182,14 @@ import * as ContextMenuModule from "@/components/ui/context-menu";
 import * as SheetModule from "@/components/ui/sheet";
 import * as SeparatorModule from "@/components/ui/separator";
 import * as ComboboxModule from "@/components/ui/combobox";
+import * as PaginationModule from "@/components/ui/pagination";
+import * as TagsInputModule from "@/components/ui/tags-input";
+import * as MultiComboboxModule from "@/components/ui/multi-combobox";
+import { Calendar as CalendarPicker, CalendarDayButton } from "@/components/ui/calendar";
+import * as DateRangePickerModule from "@/components/ui/date-range-picker";
+
+// Utilities - date-fns
+import { format } from "date-fns";
 
 /**
  * The $ registry - contains EVERYTHING available to user code
@@ -238,6 +256,15 @@ export const $: Record<string, unknown> = {
 	...SheetModule,
 	...SeparatorModule,
 	...ComboboxModule,
+	...PaginationModule,
+	...TagsInputModule,
+	...MultiComboboxModule,
+	CalendarPicker,
+	CalendarDayButton,
+	...DateRangePickerModule,
+
+	// Utilities - date-fns
+	format,
 };
 
 /**
@@ -283,6 +310,7 @@ function ErrorComponent({
  * @param source - Source code or pre-compiled JavaScript
  * @param customComponents - Additional components to inject (e.g., app-specific components)
  * @param useCompiled - If true, source is already compiled and doesn't need transformation
+ * @param externalDeps - External npm dependencies loaded from esm.sh (injected as $deps)
  * @returns A React component that renders the code
  *
  * @example
@@ -306,6 +334,7 @@ export function createComponent(
 	source: string,
 	customComponents: Record<string, React.ComponentType> = {},
 	useCompiled: boolean = false,
+	externalDeps: Record<string, Record<string, unknown>> = {},
 ): React.ComponentType {
 	// Step 1: Compile if needed
 	let compiled: string;
@@ -313,20 +342,14 @@ export function createComponent(
 	if (useCompiled) {
 		compiled = source;
 	} else {
-		const result = compileAppCode(source);
-
-		if (!result.success) {
-			// Return an error component that shows the compilation error
-			const errorMessage = result.error || "Unknown compilation error";
-			return function CompilationError() {
-				return ErrorComponent({
-					title: "Compilation Error",
-					message: errorMessage,
-				});
-			};
-		}
-
-		compiled = result.compiled!;
+		// Server-side compilation required — if we reach here without
+		// compiled code, something went wrong in the pipeline
+		return function ServerCompileRequired() {
+			return ErrorComponent({
+				title: "Compilation Required",
+				message: "This file needs server-side compilation. Save the file to trigger compilation.",
+			});
+		};
 	}
 
 	// Step 2: Build the full scope
@@ -334,11 +357,13 @@ export function createComponent(
 		...$,
 		...customComponents,
 		$: { ...$, ...customComponents }, // Also provide $ for explicit imports
+		$deps: externalDeps,
 	};
 
 	// Step 3: Create argument names and values for the function
-	// This makes everything available as direct variables (backward compat)
-	// AND as properties on $ (for import statements)
+	// Everything is available as direct variables (for code without imports)
+	// AND as properties on $ (for `var { X } = $;` from compiled imports)
+	// The compiler uses `var` (not `const`) so redeclarations don't error.
 	const argNames = Object.keys(scope);
 	const argValues = Object.values(scope);
 

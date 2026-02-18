@@ -47,6 +47,11 @@ class UserPrincipal:
     is_superuser: bool = False
     is_verified: bool = False
     roles: list[str] = field(default_factory=list)
+    embed: bool = False  # True for embed session tokens (scoped to app_id)
+    jti: str | None = None  # JWT ID for embed tokens (used for execution scoping)
+    app_id: str | None = None  # App ID for embed tokens
+    form_id: str | None = None  # Form ID for form embed tokens
+    verified_params: dict[str, str] | None = None  # HMAC-verified query params
 
     @property
     def is_platform_admin(self) -> bool:
@@ -136,6 +141,7 @@ async def get_current_user_optional(
         UserPrincipal if authenticated, None otherwise
     """
     token = None
+    token_type = "access"
 
     # Try Authorization header first (API clients)
     if credentials:
@@ -143,12 +149,16 @@ async def get_current_user_optional(
     # Fall back to cookie (browser clients)
     elif "access_token" in request.cookies:
         token = request.cookies["access_token"]
+    # Fall back to embed_token cookie (iframe embed sessions)
+    elif "embed_token" in request.cookies:
+        token = request.cookies["embed_token"]
+        token_type = "embed"
 
     if not token:
         return None
 
-    # Decode and validate token - must be an access token
-    payload = decode_token(token, expected_type="access")
+    # Decode and validate token
+    payload = decode_token(token, expected_type=token_type)
 
     if payload is None:
         return None
@@ -182,14 +192,17 @@ async def get_current_user_optional(
         except ValueError:
             logger.warning(f"Token for user {user_id} has invalid org_id format: {org_id_str}")
             return None
-    elif not is_superuser:
-        # Non-superuser without org is invalid
+    elif not is_superuser and not payload.get("embed", False):
+        # Non-superuser without org is invalid (embed tokens are exempt —
+        # they may reference forms/apps in orgs without the token holder
+        # being a member, since access was already verified via HMAC)
         logger.error(
             f"Invalid token for user {user_id}: "
             "non-superuser must have organization_id"
         )
         return None
     # else: superuser with no org = system account (valid)
+    # else: embed token without org = valid (HMAC-verified)
 
     return UserPrincipal(
         user_id=user_id,
@@ -200,6 +213,11 @@ async def get_current_user_optional(
         is_superuser=is_superuser,
         is_verified=True,
         roles=payload.get("roles", []),
+        embed=payload.get("embed", False),
+        jti=payload.get("jti"),
+        app_id=payload.get("app_id"),
+        form_id=payload.get("form_id"),
+        verified_params=payload.get("verified_params"),
     )
 
 
@@ -392,6 +410,10 @@ async def get_current_user_ws(websocket) -> UserPrincipal | None:
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:]
 
+    # Try query parameter (for embed tokens — browser WebSocket API can't set headers)
+    if not token:
+        token = websocket.query_params.get("token")
+
     if not token:
         return None
 
@@ -428,14 +450,15 @@ async def get_current_user_ws(websocket) -> UserPrincipal | None:
         except ValueError:
             logger.warning(f"WebSocket token for user {user_id} has invalid org_id format: {org_id_str}")
             return None
-    elif not is_superuser:
-        # Non-superuser without org is invalid
+    elif not is_superuser and not payload.get("embed", False):
+        # Non-superuser without org is invalid (embed tokens exempt)
         logger.error(
             f"Invalid WebSocket token for user {user_id}: "
             "non-superuser must have organization_id"
         )
         return None
     # else: superuser with no org = system account (valid)
+    # else: embed token without org = valid (HMAC-verified)
 
     return UserPrincipal(
         user_id=user_id,
@@ -446,4 +469,9 @@ async def get_current_user_ws(websocket) -> UserPrincipal | None:
         is_superuser=is_superuser,
         is_verified=True,
         roles=payload.get("roles", []),
+        embed=payload.get("embed", False),
+        jti=payload.get("jti"),
+        app_id=payload.get("app_id"),
+        form_id=payload.get("form_id"),
+        verified_params=payload.get("verified_params"),
     )

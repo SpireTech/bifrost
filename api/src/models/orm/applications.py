@@ -19,6 +19,7 @@ from src.models.enums import AppAccessLevel
 from src.models.orm.base import Base
 
 if TYPE_CHECKING:
+    from src.models.orm.app_embed_secrets import AppEmbedSecret
     from src.models.orm.app_roles import AppRole
     from src.models.orm.organizations import Organization
     from src.models.orm.tables import Table
@@ -28,7 +29,7 @@ class Application(Base):
     """Application entity for App Builder.
 
     Applications hold app metadata. Files are stored in S3 at
-    _repo/apps/{slug}/ paths, indexed in file_index table.
+    _repo/{repo_path}/ paths (defaults to apps/{slug}), indexed in file_index table.
 
     - organization_id = NULL: Global application (platform-wide)
     - organization_id = UUID: Organization-scoped application
@@ -39,6 +40,7 @@ class Application(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    repo_path: Mapped[str | None] = mapped_column(String(500), default=None)
     organization_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), default=None
     )
@@ -78,6 +80,9 @@ class Application(Base):
     tables: Mapped[list["Table"]] = relationship("Table", back_populates="application")
     roles: Mapped[list["AppRole"]] = relationship(
         "AppRole", cascade="all, delete-orphan", passive_deletes=True
+    )
+    embed_secrets: Mapped[list["AppEmbedSecret"]] = relationship(
+        "AppEmbedSecret", back_populates="application", cascade="all, delete-orphan", passive_deletes=True
     )
 
     __table_args__ = (

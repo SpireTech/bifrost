@@ -17,6 +17,7 @@ from src.models.orm.base import Base
 
 if TYPE_CHECKING:
     from src.models.orm.executions import Execution
+    from src.models.orm.form_embed_secrets import FormEmbedSecret
     from src.models.orm.organizations import Organization
 
 
@@ -27,7 +28,7 @@ class FormField(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     form_id: Mapped[UUID] = mapped_column(
-        ForeignKey("forms.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("forms.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     label: Mapped[str | None] = mapped_column(String(200), default=None)
@@ -47,7 +48,7 @@ class FormField(Base):
     # NOTE: FK now points to workflows table where type='data_provider'
     # (migrated from data_providers table in 20260103_000000)
     data_provider_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("workflows.id", ondelete="SET NULL"), default=None
+        ForeignKey("workflows.id", ondelete="SET NULL", onupdate="CASCADE"), default=None
     )
     data_provider_inputs: Mapped[dict | None] = mapped_column(JSONB, default=None)
 
@@ -135,6 +136,9 @@ class Form(Base):
         cascade="all, delete-orphan",
         order_by="FormField.position",
     )
+    embed_secrets: Mapped[list["FormEmbedSecret"]] = relationship(
+        "FormEmbedSecret", back_populates="form", cascade="all, delete-orphan", passive_deletes=True
+    )
 
     __table_args__: tuple = ()
 
@@ -144,7 +148,7 @@ class FormRole(Base):
 
     __tablename__ = "form_roles"
 
-    form_id: Mapped[UUID] = mapped_column(ForeignKey("forms.id"), primary_key=True)
+    form_id: Mapped[UUID] = mapped_column(ForeignKey("forms.id", onupdate="CASCADE"), primary_key=True)
     role_id: Mapped[UUID] = mapped_column(ForeignKey("roles.id"), primary_key=True)
     assigned_by: Mapped[str] = mapped_column(String(255))
     assigned_at: Mapped[datetime] = mapped_column(

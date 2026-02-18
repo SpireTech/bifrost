@@ -1,18 +1,16 @@
 import { Outlet } from "react-router-dom";
-import { useState } from "react";
 import { Header } from "./Header";
 import { Sidebar } from "./Sidebar";
 import { useAuth } from "@/contexts/AuthContext";
 import { NoAccess } from "@/components/NoAccess";
 import { Skeleton } from "@/components/ui/skeleton";
+import { RouteErrorBoundary } from "@/components/PageErrorBoundary";
+import { useSidebar } from "@/hooks/useSidebar";
 
 export function ContentLayout() {
-	const { isLoading, isPlatformAdmin, isOrgUser } = useAuth();
-	const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-	const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
-		// Load collapsed state from localStorage
-		return localStorage.getItem("sidebar-collapsed") === "true";
-	});
+	const { isLoading, isPlatformAdmin, isOrgUser, hasRole } = useAuth();
+	const isEmbed = hasRole("EmbedUser");
+	const { isMobileMenuOpen, setIsMobileMenuOpen, isSidebarCollapsed, toggleSidebar } = useSidebar();
 
 	// Show loading state while checking authentication
 	if (isLoading) {
@@ -36,16 +34,15 @@ export function ContentLayout() {
 	}
 
 	// Show no access page if user has no role (only authenticated, no PlatformAdmin or OrgUser)
-	const hasAccess = isPlatformAdmin || isOrgUser;
+	const hasAccess = isPlatformAdmin || isOrgUser || isEmbed;
 	if (!hasAccess) {
 		return <NoAccess />;
 	}
 
-	const toggleSidebar = () => {
-		const newState = !isSidebarCollapsed;
-		setIsSidebarCollapsed(newState);
-		localStorage.setItem("sidebar-collapsed", String(newState));
-	};
+	// Embed users get bare content — no sidebar, header, or chrome
+	if (isEmbed) {
+		return <Outlet />;
+	}
 
 	return (
 		<div className="h-screen flex bg-background overflow-hidden">
@@ -64,7 +61,9 @@ export function ContentLayout() {
 					isSidebarCollapsed={isSidebarCollapsed}
 				/>
 				<main className="flex-1 overflow-auto">
-					<Outlet />
+					<RouteErrorBoundary>
+						<Outlet />
+					</RouteErrorBoundary>
 				</main>
 			</div>
 		</div>

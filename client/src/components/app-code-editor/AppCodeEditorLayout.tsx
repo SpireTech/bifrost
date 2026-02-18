@@ -20,6 +20,7 @@ import { AppCodeEditor } from "./AppCodeEditor";
 import { AppCodePreview } from "./AppCodePreview";
 import { useAppCodeEditor } from "./useAppCodeEditor";
 import { useAppCodeUpdates, type LastUpdate } from "@/hooks/useAppCodeUpdates";
+import { authFetch } from "@/lib/api-client";
 import { JsxAppShell } from "@/components/jsx-app/JsxAppShell";
 import { toast } from "sonner";
 import {
@@ -32,6 +33,7 @@ import {
 	LayoutGrid,
 	AppWindow,
 } from "lucide-react";
+import { DependencyPanel } from "./DependencyPanel";
 import type { FileNode, FileContent, EditorCallbacks } from "@/components/file-tree/types";
 
 interface AppCodeEditorLayoutProps {
@@ -46,6 +48,7 @@ interface AppCodeEditorLayoutProps {
 }
 
 type ViewMode = "split" | "code" | "preview" | "app";
+type SidebarTab = "files" | "packages";
 
 /**
  * App Code Editor Layout
@@ -63,6 +66,7 @@ export function AppCodeEditorLayout({
 	// Layout state
 	const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 	const [viewMode, setViewMode] = useState<ViewMode>("split");
+	const [sidebarTab, setSidebarTab] = useState<SidebarTab>("files");
 
 	// Compute base path for the app preview
 	// The editor is now at /apps/{slug}/edit/* so we need to extract that base
@@ -172,6 +176,7 @@ export function AppCodeEditorLayout({
 	const {
 		state: editorState,
 		setSource,
+		setCompiled,
 		save: triggerSave,
 	} = useAppCodeEditor({
 		initialSource: currentFile?.source ?? "",
@@ -181,11 +186,29 @@ export function AppCodeEditorLayout({
 			if (!currentFile) return;
 
 			try {
-				// Save to API
-				await operations.write(currentFile.path, source);
+				// Save to API and get compiled code back
+				const response = await authFetch(
+					`/api/applications/${appId}/files/${encodeURIComponent(currentFile.path)}`,
+					{
+						method: "PUT",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ source }),
+					},
+				);
+
+				if (!response.ok) {
+					throw new Error(`Failed to save: ${response.statusText}`);
+				}
+
+				const data = await response.json();
+
+				// Update compiled code from server response
+				if (data.compiled) {
+					setCompiled(data.compiled);
+				}
 
 				// Call external save handler if provided
-				await onSave?.(currentFile.path, source, compiled);
+				await onSave?.(currentFile.path, source, data.compiled ?? compiled);
 
 				toast.success("File saved", { description: currentFile.name });
 			} catch (error) {
@@ -384,25 +407,56 @@ export function AppCodeEditorLayout({
 
 			{/* Main content */}
 			<div className="flex-1 min-h-0 flex">
-				{/* Sidebar - File Tree */}
+				{/* Sidebar */}
 				{!sidebarCollapsed && (
-					<div className="w-60 border-r flex-shrink-0 overflow-auto">
-						<FileTree
-							operations={operations}
-							iconResolver={appCodeIconResolver}
-							editor={editorCallbacks}
-							refreshTrigger={fileTreeRefresh}
-							config={{
-								enableUpload: false,
-								enableDragMove: true,
-								enableCreate: true,
-								enableRename: true,
-								enableDelete: true,
-								emptyMessage: "No files yet",
-								loadingMessage: "Loading files...",
-								pathValidator: validateAppCodePath,
-							}}
-						/>
+					<div className="w-60 border-r flex-shrink-0 flex flex-col">
+						{/* Tab switcher */}
+						<div className="flex border-b">
+							<button
+								className={`flex-1 px-3 py-1.5 text-xs font-medium ${
+									sidebarTab === "files"
+										? "border-b-2 border-primary text-foreground"
+										: "text-muted-foreground hover:text-foreground"
+								}`}
+								onClick={() => setSidebarTab("files")}
+							>
+								Files
+							</button>
+							<button
+								className={`flex-1 px-3 py-1.5 text-xs font-medium ${
+									sidebarTab === "packages"
+										? "border-b-2 border-primary text-foreground"
+										: "text-muted-foreground hover:text-foreground"
+								}`}
+								onClick={() => setSidebarTab("packages")}
+							>
+								Packages
+							</button>
+						</div>
+
+						{/* Tab content */}
+						{sidebarTab === "files" ? (
+							<div className="flex-1 overflow-auto">
+								<FileTree
+									operations={operations}
+									iconResolver={appCodeIconResolver}
+									editor={editorCallbacks}
+									refreshTrigger={fileTreeRefresh}
+									config={{
+										enableUpload: false,
+										enableDragMove: true,
+										enableCreate: true,
+										enableRename: true,
+										enableDelete: true,
+										emptyMessage: "No files yet",
+										loadingMessage: "Loading files...",
+										pathValidator: validateAppCodePath,
+									}}
+								/>
+							</div>
+						) : (
+							<DependencyPanel appId={appId} />
+						)}
 					</div>
 				)}
 

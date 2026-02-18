@@ -24,6 +24,10 @@ interface JsxPageRendererProps {
 	file: AppCodeFile;
 	/** Set of component names that exist as user files in components/ */
 	userComponentNames: Set<string>;
+	/** All pre-loaded files (for resolving components without API calls) */
+	allFiles?: AppCodeFile[];
+	/** Loaded external npm dependencies keyed by package name */
+	externalDeps?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -81,6 +85,8 @@ export function JsxPageRenderer({
 	appId,
 	file,
 	userComponentNames,
+	allFiles,
+	externalDeps,
 }: JsxPageRendererProps) {
 	const [PageComponent, setPageComponent] =
 		useState<React.ComponentType | null>(null);
@@ -109,16 +115,19 @@ export function JsxPageRenderer({
 						appId,
 						componentNames,
 						userComponentNames,
+						allFiles,
+						externalDeps ?? {},
 					);
 				}
 
 				if (cancelled) return;
 
-				// Create the page component with injected scope
+				// Use compiled code when available, skip client-side compilation
 				const Component = createComponent(
-					source,
+					file.compiled || source,
 					customComponents,
-					false,
+					!!file.compiled,
+					externalDeps ?? {},
 				);
 
 				setPageComponent(() => Component);
@@ -139,7 +148,7 @@ export function JsxPageRenderer({
 		return () => {
 			cancelled = true;
 		};
-	}, [appId, userComponentNames, file.path, file.source, source]);
+	}, [appId, userComponentNames, allFiles, externalDeps, file.path, file.source, file.compiled, source]);
 
 	if (isLoading) {
 		return <PageSkeleton />;

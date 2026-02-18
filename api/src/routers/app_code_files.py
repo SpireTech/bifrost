@@ -22,18 +22,23 @@ import re
 from enum import Enum
 from uuid import UUID
 
+import yaml
+
 from fastapi import APIRouter, HTTPException, Path, status
 
 from src.core.auth import Context, CurrentUser
 from src.core.exceptions import AccessDeniedError
 from src.models.contracts.applications import (
     AppFileUpdate,
+    AppRenderResponse,
+    RenderFileResponse,
     SimpleFileListResponse,
     SimpleFileResponse,
 )
 from src.models.orm.applications import Application
 from src.routers.applications import ApplicationRepository
 from src.services.app_storage import AppStorageService
+from src.services.repo_storage import RepoStorage
 from src.services.file_storage.service import get_file_storage_service
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/applications/{app_id}/files",
     tags=["App Code Files"],
+)
+
+render_router = APIRouter(
+    prefix="/api/applications/{app_id}",
+    tags=["App Rendering"],
 )
 
 
@@ -62,6 +72,77 @@ VALID_NAME_PATTERN = re.compile(r"^[\w-]+$")
 
 # Pattern for valid file names (requires .ts or .tsx extension)
 VALID_FILENAME_PATTERN = re.compile(r"^[\w-]+\.tsx?$")
+
+# Validation patterns for npm dependencies
+_PKG_NAME_RE = re.compile(r"^(@[a-z0-9-]+/)?[a-z0-9][a-z0-9._-]*$")
+_VERSION_RE = re.compile(r"^\^?~?\d+(\.\d+){0,2}$")
+_MAX_DEPENDENCIES = 20
+
+
+def _parse_dependencies(yaml_content: str | None) -> dict[str, str]:
+    """Parse and validate dependencies from app.yaml content.
+
+    Returns validated {name: version} dict. Skips invalid entries,
+    never raises.
+    """
+    if not yaml_content:
+        return {}
+
+    try:
+        data = yaml.safe_load(yaml_content)
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    raw_deps = data.get("dependencies")
+    if not isinstance(raw_deps, dict):
+        return {}
+
+    deps: dict[str, str] = {}
+    for name, version in raw_deps.items():
+        if len(deps) >= _MAX_DEPENDENCIES:
+            break
+
+        name_str = str(name)
+        version_str = str(version)
+
+        if not _PKG_NAME_RE.match(name_str):
+            logger.warning(f"Skipping invalid package name: {name_str}")
+            continue
+        if not _VERSION_RE.match(version_str):
+            logger.warning(f"Skipping invalid version for {name_str}: {version_str}")
+            continue
+
+        deps[name_str] = version_str
+
+    return deps
+
+
+def _serialize_dependencies(
+    deps: dict[str, str], existing_yaml: str | None
+) -> str:
+    """Serialize dependencies back into app.yaml content.
+
+    Preserves existing non-dependency fields. If no existing YAML,
+    creates a minimal file.
+    """
+    data: dict = {}
+    if existing_yaml:
+        try:
+            parsed = yaml.safe_load(existing_yaml)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            pass
+
+    if deps:
+        data["dependencies"] = deps
+    else:
+        data.pop("dependencies", None)
+
+    return yaml.dump(data, default_flow_style=False, sort_keys=False)
 
 
 def validate_file_path(path: str) -> None:
@@ -220,9 +301,10 @@ class FileMode(str, Enum):
     live = "live"
 
 
-def _repo_prefix(slug: str) -> str:
-    """Return the _repo/ path prefix for an app slug."""
-    return f"apps/{slug}/"
+def _repo_prefix(app) -> str:
+    """Return the _repo/ path prefix for an app."""
+    base = app.repo_path or f"apps/{app.slug}"
+    return f"{base.rstrip('/')}/"
 
 
 # =============================================================================
@@ -243,26 +325,54 @@ async def list_app_files(
 ) -> SimpleFileListResponse:
     """List all files for an application.
 
-    Reads from _apps/{app_id}/preview/ (draft) or _apps/{app_id}/live/ (live).
+    Source content is read from S3 (_repo/apps/{slug}/).
+    Compiled content is read from _apps/{app_id}/{mode}/.
+    The compiled field is only set when it differs from source.
     """
     app = await get_application_or_404(ctx, app_id)
     app_storage = AppStorageService()
+    repo = RepoStorage()
 
-    storage_mode = "preview" if mode == FileMode.draft else "live"
-    file_paths = await app_storage.list_files(str(app.id), storage_mode)
+    # List source files from S3 (source of truth)
+    repo_prefix = _repo_prefix(app)
+    source_paths = await repo.list(repo_prefix)
 
-    if not file_paths:
+    if not source_paths:
         return SimpleFileListResponse(files=[], total=0)
 
-    # Read content for each file
+    storage_mode = "preview" if mode == FileMode.draft else "live"
+
+    # Read source from S3 and compiled from _apps/
     files: list[SimpleFileResponse] = []
-    for rel_path in sorted(file_paths):
+    for full_path in sorted(source_paths):
+        # Derive relative path by stripping the repo prefix
+        rel_path = full_path[len(repo_prefix):]
+        if not rel_path:
+            continue
+        # Skip app.yaml (manifest metadata, not a source file)
+        if rel_path == "app.yaml":
+            continue
+        # Skip folder marker entries
+        if rel_path.endswith("/"):
+            continue
+
+        # Source from S3 (_repo/)
         try:
-            content_bytes = await app_storage.read_file(str(app.id), storage_mode, rel_path)
-            source = content_bytes.decode("utf-8", errors="replace")
-        except FileNotFoundError:
+            source = (await repo.read(full_path)).decode("utf-8", errors="replace")
+        except Exception:
             source = ""
-        files.append(SimpleFileResponse(path=rel_path, source=source))
+
+        # Compiled from _apps/{app_id}/{mode}/
+        compiled: str | None = None
+        try:
+            compiled_bytes = await app_storage.read_file(str(app.id), storage_mode, rel_path)
+            compiled_str = compiled_bytes.decode("utf-8", errors="replace")
+            if compiled_str != source:
+                compiled = compiled_str
+        except FileNotFoundError:
+            pass
+
+        files.append(SimpleFileResponse(path=rel_path, source=source, compiled=compiled))
 
     return SimpleFileListResponse(files=files, total=len(files))
 
@@ -281,22 +391,39 @@ async def read_app_file(
 ) -> SimpleFileResponse:
     """Read a single file by relative path.
 
-    Reads from _apps/{app_id}/preview/ (draft) or _apps/{app_id}/live/ (live).
+    Source content is read from the file_index (_repo/apps/{slug}/).
+    Compiled content is read from _apps/{app_id}/{mode}/.
+    The compiled field is only set when it differs from source.
     """
     app = await get_application_or_404(ctx, app_id)
     app_storage = AppStorageService()
 
-    storage_mode = "preview" if mode == FileMode.draft else "live"
+    # Source from S3 (_repo/)
+    repo_path = f"{_repo_prefix(app)}{file_path}"
+    repo = RepoStorage()
     try:
-        content_bytes = await app_storage.read_file(str(app.id), storage_mode, file_path)
-        source = content_bytes.decode("utf-8", errors="replace")
-    except FileNotFoundError:
+        source = (await repo.read(repo_path)).decode("utf-8", errors="replace")
+    except Exception:
+        source = None
+    if source is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"File '{file_path}' not found",
         )
 
-    return SimpleFileResponse(path=file_path, source=source)
+    # Compiled from _apps/{app_id}/{mode}/
+    compiled: str | None = None
+    storage_mode = "preview" if mode == FileMode.draft else "live"
+    try:
+        compiled_bytes = await app_storage.read_file(str(app.id), storage_mode, file_path)
+        compiled_str = compiled_bytes.decode("utf-8", errors="replace")
+        # Only set compiled if it differs from source
+        if compiled_str != source:
+            compiled = compiled_str
+    except FileNotFoundError:
+        pass
+
+    return SimpleFileResponse(path=file_path, source=source, compiled=compiled)
 
 
 @router.put(
@@ -321,7 +448,7 @@ async def write_app_file(
     # Validate path conventions
     validate_file_path(file_path)
 
-    prefix = _repo_prefix(app.slug)
+    prefix = _repo_prefix(app)
     full_path = f"{prefix}{file_path}"
     source = data.source or ""
 
@@ -332,8 +459,17 @@ async def write_app_file(
         updated_by=user.email or "unknown",
     )
 
+    # Compile server-side and return compiled code in the response
+    compiled_js: str | None = None
+    if file_path.endswith((".tsx", ".ts")):
+        from src.services.app_compiler import AppCompilerService
+        compiler = AppCompilerService()
+        result = await compiler.compile_file(source, file_path)
+        if result.success:
+            compiled_js = result.compiled
+
     logger.info(f"Wrote app file '{file_path}' for app {app_id} (slug={app.slug})")
-    return SimpleFileResponse(path=file_path, source=source)
+    return SimpleFileResponse(path=file_path, source=source, compiled=compiled_js)
 
 
 @router.delete(
@@ -353,10 +489,204 @@ async def delete_app_file(
     file_index cleanup, pubsub, and preview sync).
     """
     app = await get_application_or_404(ctx, app_id)
-    prefix = _repo_prefix(app.slug)
+    prefix = _repo_prefix(app)
     full_path = f"{prefix}{file_path}"
 
     storage = get_file_storage_service(ctx.db)
     await storage.delete_file(full_path)
 
     logger.info(f"Deleted app file '{file_path}' from app {app_id} (slug={app.slug})")
+
+
+# =============================================================================
+# Render endpoint — compiled JS only, reads from S3 (_apps/)
+# =============================================================================
+
+_COMPILABLE_EXTENSIONS = (".tsx", ".ts")
+
+
+def _looks_like_jsx(content: str) -> bool:
+    """Quick heuristic: uncompiled TSX/TS contains JSX or import statements."""
+    return "import " in content or "</" in content or "=>" in content
+
+
+@render_router.get(
+    "/render",
+    response_model=AppRenderResponse,
+    summary="Get all compiled files for rendering",
+)
+async def render_app(
+    app_id: UUID = Path(..., description="Application UUID"),
+    mode: FileMode = FileMode.draft,
+    ctx: Context = None,
+    user: CurrentUser = None,
+) -> AppRenderResponse:
+    """Return all files as compiled JS, ready for client-side execution.
+
+    Reads entirely from S3 (_apps/{app_id}/{mode}/).  If any compilable
+    files still contain raw TSX/TS (pre-compilation era), the entire app
+    is batch-compiled and the results written back to S3.
+
+    Unlike /files, this returns only `path` + `code` (no source).
+    """
+    app = await get_application_or_404(ctx, app_id)
+    app_storage = AppStorageService()
+    storage_mode = "preview" if mode == FileMode.draft else "live"
+    app_id_str = str(app.id)
+
+    # Read dependencies from app.yaml in S3
+    dependencies: dict[str, str] = {}
+    try:
+        repo = RepoStorage()
+        yaml_bytes = await repo.read(f"{_repo_prefix(app)}app.yaml")
+        yaml_content = yaml_bytes.decode("utf-8", errors="replace")
+        dependencies = _parse_dependencies(yaml_content)
+    except Exception:
+        pass
+
+    # 1. Try Redis cache first
+    cached = await app_storage.get_render_cache(app_id_str, storage_mode)
+    if cached:
+        files = [
+            RenderFileResponse(path=p, code=c)
+            for p, c in sorted(cached.items())
+        ]
+        return AppRenderResponse(files=files, total=len(files), dependencies=dependencies)
+
+    # 2. Cache miss — read from S3
+    rel_paths = await app_storage.list_files(app_id_str, storage_mode)
+    if not rel_paths:
+        return AppRenderResponse(files=[], total=0, dependencies=dependencies)
+
+    file_contents: dict[str, str] = {}
+    for rel_path in rel_paths:
+        if rel_path == "app.yaml":
+            continue
+        content_bytes = await app_storage.read_file(app_id_str, storage_mode, rel_path)
+        file_contents[rel_path] = content_bytes.decode("utf-8", errors="replace")
+
+    # 3. If any compilable files look uncompiled, batch-compile and write back
+    needs_compile = [
+        rel for rel, content in file_contents.items()
+        if rel.endswith(_COMPILABLE_EXTENSIONS) and _looks_like_jsx(content)
+    ]
+
+    if needs_compile:
+        from src.services.app_compiler import AppCompilerService
+
+        compiler = AppCompilerService()
+        batch_input = [
+            {"path": rel, "source": file_contents[rel]}
+            for rel in needs_compile
+        ]
+
+        results = await compiler.compile_batch(batch_input)
+        for result in results:
+            if result.success and result.compiled:
+                file_contents[result.path] = result.compiled
+                await app_storage.write_preview_file(
+                    app_id_str,
+                    result.path,
+                    result.compiled.encode("utf-8"),
+                )
+
+        logger.info(
+            f"On-demand compiled {len(needs_compile)} files for app {app_id}"
+        )
+
+    # 4. Warm the Redis cache
+    await app_storage.set_render_cache(app_id_str, storage_mode, file_contents)
+
+    # 5. Build response
+    files = [
+        RenderFileResponse(path=rel_path, code=code)
+        for rel_path, code in sorted(file_contents.items())
+    ]
+
+    return AppRenderResponse(files=files, total=len(files), dependencies=dependencies)
+
+
+# =============================================================================
+# Dependencies endpoints — read/write app.yaml dependencies section
+# =============================================================================
+
+
+@render_router.get(
+    "/dependencies",
+    response_model=dict[str, str],
+    summary="Get app dependencies",
+)
+async def get_dependencies(
+    app_id: UUID = Path(..., description="Application UUID"),
+    ctx: Context = None,
+    user: CurrentUser = None,
+) -> dict[str, str]:
+    """Return the validated dependencies dict from app.yaml."""
+    app = await get_application_or_404(ctx, app_id)
+    repo = RepoStorage()
+    try:
+        yaml_content = (await repo.read(f"{_repo_prefix(app)}app.yaml")).decode("utf-8", errors="replace")
+    except Exception:
+        yaml_content = None
+    return _parse_dependencies(yaml_content)
+
+
+@render_router.put(
+    "/dependencies",
+    response_model=dict[str, str],
+    summary="Update app dependencies",
+)
+async def put_dependencies(
+    deps: dict[str, str],
+    app_id: UUID = Path(..., description="Application UUID"),
+    ctx: Context = None,
+    user: CurrentUser = None,
+) -> dict[str, str]:
+    """Replace the dependencies section of app.yaml.
+
+    Validates every package name and version, enforces the max-dependency
+    limit, then writes back to app.yaml preserving other fields.
+    """
+    app = await get_application_or_404(ctx, app_id)
+
+    # Validate
+    if len(deps) > _MAX_DEPENDENCIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many dependencies (max {_MAX_DEPENDENCIES})",
+        )
+    for name, version in deps.items():
+        if not _PKG_NAME_RE.match(name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid package name: {name}",
+            )
+        if not _VERSION_RE.match(version):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid version for {name}: {version}",
+            )
+
+    # Read existing app.yaml
+    yaml_path = f"{_repo_prefix(app)}app.yaml"
+    repo = RepoStorage()
+    try:
+        existing_yaml = (await repo.read(yaml_path)).decode("utf-8", errors="replace")
+    except Exception:
+        existing_yaml = None
+
+    # Serialize and write back
+    new_yaml = _serialize_dependencies(deps, existing_yaml)
+    storage = get_file_storage_service(ctx.db)
+    await storage.write_file(
+        path=yaml_path,
+        content=new_yaml.encode("utf-8"),
+        updated_by=user.email or "unknown",
+    )
+
+    # Invalidate render cache
+    app_storage = AppStorageService()
+    await app_storage.invalidate_render_cache(str(app.id))
+
+    logger.info(f"Updated dependencies for app {app_id}: {list(deps.keys())}")
+    return deps

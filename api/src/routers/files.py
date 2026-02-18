@@ -105,6 +105,24 @@ class FileExistsResponse(BaseModel):
     exists: bool = Field(..., description="True if file exists")
 
 
+class FilePushRequest(BaseModel):
+    """Request to push multiple files to _repo/."""
+    files: dict[str, str] = Field(..., description="Map of repo_path to content")
+    delete_missing_prefix: str | None = Field(
+        default=None,
+        description="If set, delete files under this prefix not in the push batch",
+    )
+
+
+class FilePushResponse(BaseModel):
+    """Response for file push."""
+    created: int = 0
+    updated: int = 0
+    deleted: int = 0
+    unchanged: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
 # =============================================================================
 # Basic CRUD Endpoints (SDK-focused)
 # =============================================================================
@@ -238,6 +256,102 @@ async def file_exists(
 
 
 # =============================================================================
+# Batch Push Endpoint (CLI-focused)
+# =============================================================================
+
+
+@router.post("/push", response_model=FilePushResponse)
+async def push_files(
+    request: FilePushRequest,
+    ctx: Context,
+    user: CurrentSuperuser,
+    db: AsyncSession = Depends(get_db),
+) -> FilePushResponse:
+    """
+    Push multiple files to _repo/ in a single batch.
+
+    For each file in the request, writes content via FileStorageService.
+    Compares content hashes to skip unchanged files.
+    If delete_missing_prefix is set, deletes files under that prefix
+    that are not in the push batch.
+    """
+    file_storage = FileStorageService(db)
+    created = 0
+    updated = 0
+    unchanged = 0
+    deleted = 0
+    errors = []
+
+    for repo_path, content in request.files.items():
+        try:
+            # Check if file already exists with same content
+            from src.models.orm.file_index import FileIndex
+            from sqlalchemy import select
+
+            existing = await db.execute(
+                select(FileIndex.content_hash).where(FileIndex.path == repo_path)
+            )
+            existing_hash = existing.scalar_one_or_none()
+
+            # Compute hash of new content
+            content_bytes = content.encode("utf-8")
+            new_hash = hashlib.sha256(content_bytes).hexdigest()
+
+            if existing_hash == new_hash:
+                unchanged += 1
+                continue
+
+            was_new = existing_hash is None
+            await file_storage.write_file(
+                path=repo_path,
+                content=content_bytes,
+                updated_by=user.email or "cli",
+            )
+
+            if was_new:
+                created += 1
+            else:
+                updated += 1
+
+        except Exception as e:
+            logger.warning(f"Error pushing file {repo_path}: {e}")
+            errors.append(f"{repo_path}: {str(e)}")
+
+    # Handle delete_missing_prefix
+    if request.delete_missing_prefix:
+        prefix = request.delete_missing_prefix
+        if not prefix.endswith("/"):
+            prefix += "/"
+
+        from src.models.orm.file_index import FileIndex
+        from sqlalchemy import select
+
+        existing_files = await db.execute(
+            select(FileIndex.path).where(FileIndex.path.startswith(prefix))
+        )
+        existing_paths = {row[0] for row in existing_files.all()}
+        push_paths = set(request.files.keys())
+
+        for path_to_delete in existing_paths - push_paths:
+            try:
+                await file_storage.delete_file(path_to_delete)
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Error deleting file {path_to_delete}: {e}")
+                errors.append(f"delete {path_to_delete}: {str(e)}")
+
+    await db.commit()
+
+    return FilePushResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        unchanged=unchanged,
+        errors=errors,
+    )
+
+
+# =============================================================================
 # Editor Endpoints (Cloud mode only, with rich metadata)
 # These endpoints are used by the browser-based editor and maintain
 # backward compatibility with /api/editor/files/* functionality.
@@ -261,30 +375,65 @@ async def list_files_editor(
     List files and folders in a directory with rich metadata.
 
     Cloud mode only - used by browser editor.
+    Lists directly from S3 via RepoStorage (source of truth).
     """
+    from src.services.repo_storage import RepoStorage
+
     try:
-        storage = FileStorageService(db)
-        file_entries = await storage.list_files(path, recursive=recursive)
+        repo = RepoStorage()
 
-        files = []
-        for entry in file_entries:
-            is_folder = entry.path.endswith("/")
-            clean_path = entry.path.rstrip("/") if is_folder else entry.path
+        # Normalize path: "." or "" means root
+        prefix = "" if path in (".", "") else path.rstrip("/") + "/"
 
+        if recursive:
+            from src.services.editor.file_filter import is_excluded_path
+            all_paths = await repo.list(prefix)
+            return [
+                FileMetadata(
+                    path=p,
+                    name=p.split("/")[-1],
+                    type=FileType.FILE,
+                    size=None,
+                    extension=p.split(".")[-1] if "." in p.split("/")[-1] else None,
+                    modified=datetime.now(timezone.utc).isoformat(),
+                )
+                for p in sorted(all_paths)
+                if not is_excluded_path(p)
+            ]
+
+        # Non-recursive: get direct children
+        child_files, child_folders = await repo.list_directory(prefix)
+
+        files: list[FileMetadata] = []
+
+        # Folders first
+        for folder_path in child_folders:
+            clean = folder_path.rstrip("/")
             files.append(FileMetadata(
-                path=clean_path,
-                name=clean_path.split("/")[-1],
-                type=FileType.FOLDER if is_folder else FileType.FILE,
-                size=entry.size_bytes if not is_folder else None,
-                extension=entry.path.split(".")[-1] if "." in entry.path and not is_folder else None,
-                modified=entry.updated_at.isoformat() if entry.updated_at else datetime.now(timezone.utc).isoformat(),
+                path=clean,
+                name=clean.split("/")[-1],
+                type=FileType.FOLDER,
+                size=None,
+                extension=None,
+                modified=datetime.now(timezone.utc).isoformat(),
             ))
+
+        # Then files
+        for file_path in child_files:
+            name = file_path.split("/")[-1]
+            files.append(FileMetadata(
+                path=file_path,
+                name=name,
+                type=FileType.FILE,
+                size=None,
+                extension=name.split(".")[-1] if "." in name else None,
+                modified=datetime.now(timezone.utc).isoformat(),
+            ))
+
         return files
 
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except FileNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Directory not found: {path}")
 
 
 @router.get(
@@ -542,22 +691,24 @@ async def delete_file_editor(
     Delete a file or folder recursively.
 
     Cloud mode only - used by browser editor.
+    Uses S3 prefix listing to detect folders (no file_index markers needed).
     """
-    from sqlalchemy import select
-    from src.models.orm.file_index import FileIndex
+    from src.services.repo_storage import RepoStorage
 
     try:
         storage = FileStorageService(db)
+        repo = RepoStorage()
 
-        # Check if this is a folder (path ending with /)
-        folder_path = path.rstrip("/") + "/"
-        stmt = select(FileIndex.path).where(FileIndex.path == folder_path)
-        result = await db.execute(stmt)
-        is_folder = result.scalar_one_or_none() is not None
+        # Check if this is a folder by listing S3 for children
+        folder_prefix = path.rstrip("/") + "/"
+        children = await repo.list(folder_prefix)
 
-        if is_folder:
-            await storage.delete_folder(path)
+        if children:
+            # Folder delete: delete each child; any failure should fail request
+            for child_path in children:
+                await storage.delete_file(child_path)
         else:
+            # Single file delete
             await storage.delete_file(path)
 
     except ValueError as e:

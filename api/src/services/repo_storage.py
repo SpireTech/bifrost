@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from aiobotocore.session import get_session
@@ -96,6 +97,77 @@ class RepoStorage:
             continuation_token = response.get("NextContinuationToken")
 
         return paths
+
+    async def list_directory(
+        self,
+        prefix: str = "",
+        exclude_fn: Callable[[str], bool] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """List direct children of a directory in _repo/.
+
+        Returns (files, folders) where:
+        - files: full relative paths of direct child files
+        - folders: full relative paths of direct child directories (with trailing /)
+
+        Uses S3 Delimiter='/' for efficient non-recursive listing that scales
+        with the number of direct children, not total descendants.
+
+        Args:
+            prefix: Directory prefix (e.g. "apps/myapp/"). Empty string for root.
+            exclude_fn: Optional filter function(path) -> bool. If True, path is excluded.
+        """
+        from src.services.editor.file_filter import is_excluded_path
+
+        filter_fn = exclude_fn or is_excluded_path
+
+        async with self._get_client() as client:
+            raw_files, raw_folders = await self._list_directory_from_s3(client, prefix)
+
+        files = [f for f in raw_files if not filter_fn(f)]
+        folders = [d for d in raw_folders if not filter_fn(d.rstrip("/"))]
+
+        return sorted(files), sorted(folders)
+
+    async def _list_directory_from_s3(
+        self, client, prefix: str = ""
+    ) -> tuple[list[str], list[str]]:
+        """Non-recursive S3 listing using Delimiter='/'.
+
+        Returns (files, folders) as relative paths under _repo/.
+        """
+        full_prefix = self._repo_key(prefix)
+        files: list[str] = []
+        folders: list[str] = []
+        continuation_token = None
+
+        while True:
+            kwargs: dict = {
+                "Bucket": self._bucket,
+                "Prefix": full_prefix,
+                "Delimiter": "/",
+            }
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+
+            response = await client.list_objects_v2(**kwargs)
+
+            # Direct child files
+            for obj in response.get("Contents", []):
+                rel_path = obj["Key"][len(REPO_PREFIX):]
+                if rel_path:
+                    files.append(rel_path)
+
+            # Direct child folders (CommonPrefixes)
+            for prefix_obj in response.get("CommonPrefixes", []):
+                folder_path = prefix_obj["Prefix"][len(REPO_PREFIX):]
+                if folder_path:
+                    folders.append(folder_path)
+
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        return files, folders
 
     async def exists(self, path: str) -> bool:
         """Check if a file exists in _repo/."""

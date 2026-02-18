@@ -5,6 +5,9 @@ Tools for listing, creating, getting, updating, publishing apps,
 plus schema documentation.
 
 Applications use code-based files (TSX/TypeScript) stored in file_index table.
+
+Note: `get_app_schema` provides a concise platform overview and component index.
+For detailed component documentation (props, variants, examples), use `get_component_docs`.
 """
 
 import logging
@@ -142,6 +145,7 @@ async def create_app(
                 description=description,
                 organization_id=effective_org_id,
                 created_by=str(context.user_id),
+                repo_path=f"apps/{slug}",
             )
             db.add(app)
             await db.flush()
@@ -423,6 +427,125 @@ async def publish_app(context: Any, app_id: str) -> ToolResult:
         return error_result(f"Error publishing app: {str(e)}")
 
 
+async def get_component_docs(
+    context: Any,  # noqa: ARG001
+    components: str = "",
+    category: str = "",
+) -> ToolResult:
+    """
+    Get detailed documentation for available UI components.
+
+    Args:
+        components: Comma-separated component names (e.g. "Button,Card,Table").
+                    Returns detailed docs for those specific components.
+        category: Filter by category. One of: layout, forms, display, navigation,
+                  feedback, data, typography.
+                  Returns all components in that category.
+
+    If neither components nor category is provided, returns a category index
+    listing all available components grouped by category.
+    """
+    from src.services.mcp_server.component_docs import CATEGORIES, COMPONENT_DOCS
+
+    # Case 1: Specific components requested
+    if components:
+        names = [c.strip() for c in components.split(",") if c.strip()]
+        results: dict[str, dict] = {}
+        not_found: list[str] = []
+        for name in names:
+            if name in COMPONENT_DOCS:
+                results[name] = COMPONENT_DOCS[name]
+            else:
+                not_found.append(name)
+
+        lines = []
+        for name, doc in results.items():
+            lines.append(f"## {name}")
+            lines.append(f"**Category**: {CATEGORIES.get(doc.get('category', ''), doc.get('category', ''))}")
+            lines.append(f"**Description**: {doc['description']}")
+            if doc.get("children"):
+                lines.append(f"**Children**: {', '.join(doc['children'])}")
+            if doc.get("props"):
+                lines.append("**Props**:")
+                for prop_name, prop_desc in doc["props"].items():
+                    lines.append(f"  - `{prop_name}`: {prop_desc}")
+            if doc.get("example"):
+                lines.append(f"**Example**:\n```tsx\n{doc['example']}\n```")
+            lines.append("")
+
+        if not_found:
+            lines.append(f"**Not found**: {', '.join(not_found)}")
+
+        display_text = "\n".join(lines)
+        return success_result(display_text, {
+            "components": results,
+            "not_found": not_found,
+        })
+
+    # Case 2: Category filter
+    if category:
+        if category not in CATEGORIES:
+            return error_result(
+                f"Unknown category '{category}'. Valid categories: {', '.join(CATEGORIES.keys())}"
+            )
+
+        cat_components: dict[str, dict] = {
+            name: doc for name, doc in COMPONENT_DOCS.items()
+            if doc.get("category") == category
+        }
+
+        lines = [f"# {CATEGORIES[category]}", ""]
+        for name, doc in cat_components.items():
+            lines.append(f"## {name}")
+            lines.append(f"**Description**: {doc['description']}")
+            if doc.get("children"):
+                lines.append(f"**Children**: {', '.join(doc['children'])}")
+            if doc.get("props"):
+                lines.append("**Props**:")
+                for prop_name, prop_desc in doc["props"].items():
+                    lines.append(f"  - `{prop_name}`: {prop_desc}")
+            if doc.get("example"):
+                lines.append(f"**Example**:\n```tsx\n{doc['example']}\n```")
+            lines.append("")
+
+        display_text = "\n".join(lines)
+        return success_result(display_text, {
+            "category": category,
+            "category_label": CATEGORIES[category],
+            "components": cat_components,
+            "count": len(cat_components),
+        })
+
+    # Case 3: No filter -- return category index
+    index: dict[str, list[str]] = {cat: [] for cat in CATEGORIES}
+    for name, doc in COMPONENT_DOCS.items():
+        cat = doc.get("category", "")
+        if cat in index:
+            index[cat].append(name)
+
+    lines = ["# Component Categories", ""]
+    for cat_key, cat_label in CATEGORIES.items():
+        comp_names = index.get(cat_key, [])
+        lines.append(f"## {cat_label} ({len(comp_names)} components)")
+        lines.append(", ".join(comp_names))
+        lines.append("")
+
+    lines.append("Use `components` parameter for specific component docs,")
+    lines.append("or `category` parameter to see all components in a category.")
+
+    display_text = "\n".join(lines)
+    return success_result(display_text, {
+        "categories": {
+            cat_key: {
+                "label": cat_label,
+                "components": index.get(cat_key, []),
+            }
+            for cat_key, cat_label in CATEGORIES.items()
+        },
+        "total_components": sum(len(v) for v in index.values()),
+    })
+
+
 async def get_app_schema(context: Any) -> ToolResult:  # noqa: ARG001
     """Get application schema documentation for code-based apps."""
     from src.models.contracts.applications import (
@@ -436,302 +559,650 @@ async def get_app_schema(context: Any) -> ToolResult:  # noqa: ARG001
         (ApplicationUpdate, "ApplicationUpdate (for updating apps)"),
     ], "Application Models")
 
-    # Documentation for code-based apps
+    # Documentation for code-based apps (concise overview; use get_component_docs for detailed component API)
     overview = r"""# App Builder Schema Documentation
 
-Applications in Bifrost use a code-based approach with TypeScript/TSX files.
+Applications in Bifrost use TypeScript/TSX files. For detailed component docs (props, variants, examples), use the `get_component_docs` tool.
 
-## App Builder Tool Hierarchy
+## Tool Hierarchy
 
-Apps are managed at two levels:
+**App Level**: `list_apps`, `get_app`, `update_app`, `publish_app`
+**File Level**: `code_list_files`, `code_get_file`, `code_create_file`, `code_update_file`, `code_delete_file`
 
-### App Level
-- `list_apps` - List all applications with file counts
-- `get_app` - Get app metadata and file list
-- `update_app` - Update app settings (name, description)
-- `publish_app` - Publish all draft files to live
+## File Structure & Paths
 
-### File Level
-- `code_list_files` - List all files in an app
-- `code_get_file` - Get a specific file's content
-- `code_create_file` - Create a new file
-- `code_update_file` - Update a file's content
-- `code_delete_file` - Delete a file
+- `_layout.tsx` — Root layout (required, must use `<Outlet />` not `{children}`)
+- `_providers.tsx` — Optional providers wrapper
+- `pages/*.tsx` — Routes (e.g., `pages/index.tsx` = `/`, `pages/clients/[id].tsx` = `/clients/:id`)
+- `components/*.tsx` — Reusable UI components
+- `modules/*.ts` — Utility modules
 
-**Workflow**: Use `get_app` to see files, then file tools for editing.
+## Imports
 
----
+App files use standard ES import syntax. The server-side compiler transforms imports automatically:
 
-## File Structure
-
-Applications use a file-based structure:
-
-```
-_layout.tsx          # Root layout wrapper (required)
-_providers.tsx       # Optional providers wrapper
-pages/
-  index.tsx          # Home page (/)
-  about.tsx          # About page (/about)
-  clients/
-    index.tsx        # Clients list (/clients)
-    [id].tsx         # Client detail (/clients/:id)
-components/
-  Button.tsx         # Shared components
-  Card.tsx
-modules/
-  api.ts             # Utility modules
-  utils.ts
+**Bifrost imports** — platform components, hooks, icons, utilities:
+```tsx
+import { Button, Card, useWorkflowQuery, useState } from "bifrost";
 ```
 
-## File Path Conventions
+**External npm imports** — packages declared in `app.yaml` dependencies:
+```tsx
+import dayjs from "dayjs";
+import { LineChart, Line } from "recharts";
+```
 
-- Root files: `_layout.tsx`, `_providers.tsx` only
-- Pages: `pages/*.tsx` - automatically become routes
-- Components: `components/*.tsx` - reusable UI
-- Modules: `modules/*.ts` - utilities and helpers
-- Dynamic routes: `[param].tsx` syntax
+Everything from `"bifrost"` is also available in scope without importing (for backwards compatibility), but **using explicit imports is the recommended pattern**.
 
-## CRITICAL: No Import Statements
+### Available from "bifrost"
 
-**App files must NOT contain import statements.** The Bifrost runtime automatically provides all necessary modules in scope:
+- **React**: `useState`, `useEffect`, `useMemo`, `useCallback`, `useRef`, etc.
+- **Bifrost hooks**: `useWorkflowQuery`, `useWorkflowMutation`, `useUser`, `useNavigate`, `useLocation`, `useParams`
+- **Routing**: `Outlet`, `Link`, `NavLink`, `Navigate`
+- **UI**: Button, Card, Table, Select, Badge, Input, Skeleton, Pagination, Calendar, DateRangePicker, MultiCombobox, TagsInput, Combobox, Slider, Dialog, Alert, Tabs, etc.
+- **Icons**: All lucide-react icons (e.g., `Loader2`, `RefreshCw`, `Check`, `X`)
+- **Utilities**: `cn` (className merging), `format` (date-fns)
 
-- **React hooks**: `useState`, `useEffect`, `useMemo`, `useCallback`, etc.
-- **Bifrost hooks**: `useWorkflow`, `useUser`, `useNavigate`, `useLocation`, `useParams`
-- **Routing**: `Outlet`, `Link`
-- **UI components**: `Button`, `Card`, `Table`, `Select`, `Badge`, `Input`, `Skeleton`, etc.
-- **Icons**: All lucide-react icons (`Loader2`, `RefreshCw`, `Check`, `X`, `Building2`, etc.)
-- **Utilities**: `cn` (for className merging)
+## External Dependencies (npm packages)
 
-If you add import statements, you will get: `Cannot use import statement outside a module`
+Apps can use npm packages loaded at runtime from esm.sh CDN.
+
+### Declaring dependencies in `app.yaml`:
+```yaml
+name: My Dashboard
+description: Analytics dashboard
+dependencies:
+  recharts: "2.12"
+  dayjs: "1.11"
+```
+
+### Using in code:
+```tsx
+import { LineChart, Line, XAxis, YAxis } from "recharts";
+import dayjs from "dayjs";
+
+export default function Dashboard() {
+  const { data } = useWorkflowQuery("workflow-uuid");
+  return (
+    <LineChart data={data}>
+      <XAxis dataKey="date" tickFormatter={(d) => dayjs(d).format("MMM D")} />
+      <YAxis />
+      <Line dataKey="value" />
+    </LineChart>
+  );
+}
+```
+
+### Managing dependencies via API:
+- `GET /api/applications/{app_id}/dependencies` — returns current deps
+- `PUT /api/applications/{app_id}/dependencies` — update deps (max 20, validates package names and versions)
+
+### Via `push_files`:
+Include the `dependencies` field in `app.yaml` when pushing files.
+
+### Rules:
+- Max 20 dependencies per app
+- Version format: semver with optional `^` or `~` prefix (e.g., `"2.12"`, `"^1.5.3"`)
+- Package names: lowercase, hyphens, optional `@scope/` prefix
+
+## Available Components (use `get_component_docs` for full API)
+
+**Layout**: Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter, Separator
+**Data Display**: Table, TableHeader, TableBody, TableRow, TableHead, TableCell, Badge, Skeleton
+**Forms**: Input, Button, Select, Combobox, MultiCombobox, TagsInput, Slider, Calendar, DateRangePicker
+**Feedback**: Alert, AlertTitle, AlertDescription, Dialog, DialogTrigger, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter
+**Navigation**: Tabs, TabsList, TabsTrigger, TabsContent, Pagination, Link
+**Overlay**: Tooltip, TooltipTrigger, TooltipContent, Popover, PopoverTrigger, PopoverContent
 
 ## Workflow Hooks
 
-**CRITICAL: Always use workflow IDs, not names.**
+**CRITICAL: Always use workflow UUIDs, not names.** Get IDs via `list_workflows` first.
 
-```tsx
-// CORRECT - use the workflow UUID
-const { data } = useWorkflowQuery("ef8cf1f2-b451-47f4-aee8-336f7cb21d33");
+### useWorkflowQuery(workflowId, params?, options?)
 
-// WRONG - names don't work
-const { data } = useWorkflowQuery("list_csp_tenants");
-```
-
-Get workflow IDs using `list_workflows` before building the app.
-
-Two hooks are available:
-- `useWorkflowQuery` — for loading data (runs automatically on mount)
-- `useWorkflowMutation` — for user-triggered actions (runs when you call `execute()`)
-
-### useWorkflowQuery
-
-Declarative data fetching. Executes automatically on mount, re-executes when params change.
+Auto-executes on mount. For reading/loading data.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `data` | `T \| null` | The workflow result data (null until completed) |
-| `isLoading` | `boolean` | True while the workflow is executing |
-| `isError` | `boolean` | True if the workflow failed |
-| `error` | `string \| null` | Error message if workflow failed |
-| `logs` | `StreamingLog[]` | Streaming logs array (updates in real-time) |
-| `refetch` | `() => Promise<T>` | Re-execute the workflow |
-| `executionId` | `string \| null` | Current execution ID |
-| `status` | `string \| null` | Execution status |
+| `data` | `T \| null` | Result data (null until completed) |
+| `isLoading` | `boolean` | True while executing |
+| `isError` | `boolean` | True if failed |
+| `error` | `string \| null` | Error message |
+| `refetch` | `() => Promise<T>` | Re-execute |
+| `logs` | `StreamingLog[]` | Real-time streaming logs |
 
-Options (third parameter): `{ enabled?: boolean }` — set `enabled: false` to skip automatic execution.
+Options: `{ enabled?: boolean }` — set `false` to defer execution.
 
-### useWorkflowMutation
+### useWorkflowMutation(workflowId)
 
-Imperative execution. Does nothing until `execute()` is called. `execute()` returns `Promise<T>` with the actual result.
+Manual execution via `execute()`. For user-triggered actions.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `execute` | `(params?) => Promise<T>` | Execute the workflow. Returns the result directly. |
-| `isLoading` | `boolean` | True while the workflow is executing |
-| `isError` | `boolean` | True if the last execution failed |
-| `error` | `string \| null` | Error message from last execution |
-| `data` | `T \| null` | Result data from last execution |
-| `logs` | `StreamingLog[]` | Streaming logs array (updates in real-time) |
-| `reset` | `() => void` | Reset data, error, and loading state |
-| `executionId` | `string \| null` | Current execution ID |
-| `status` | `string \| null` | Execution status |
+| `execute` | `(params?) => Promise<T>` | Run the workflow, returns result |
+| `isLoading` | `boolean` | True while executing |
+| `isError` | `boolean` | True if failed |
+| `error` | `string \| null` | Error message |
+| `data` | `T \| null` | Last result |
+| `reset` | `() => void` | Reset state |
+| `logs` | `StreamingLog[]` | Real-time streaming logs |
 
-### Usage Patterns
-
-**Pattern 1: Load data on mount (`useWorkflowQuery`)**
-
-Best for workflows that load data when the page loads.
+### Quick Patterns
 
 ```tsx
-const { data, isLoading, error } = useWorkflowQuery("workflow-id", { limit: 10 });
+// Load data on mount
+const { data, isLoading } = useWorkflowQuery("workflow-uuid", { limit: 10 });
 
-if (isLoading) return <Skeleton />;
-if (error) return <Alert>{error}</Alert>;
+// Button-triggered action
+const { execute, isLoading } = useWorkflowMutation("workflow-uuid");
+const result = await execute({ name: "New Item" });
 
-return <CustomerList data={data} />;
+// Conditional loading
+const { data } = useWorkflowQuery("workflow-uuid", { id }, { enabled: !!id });
 ```
 
-**Pattern 2: Button-triggered action (`useWorkflowMutation`)**
+## Layout Tips
 
-Best for user-triggered actions like create, update, delete.
-
-```tsx
-const { execute, isLoading } = useWorkflowMutation("create-item-workflow");
-
-const handleCreate = async () => {
-  try {
-    const result = await execute({ name: "New Item" });
-    setItems(prev => [...prev, result.item]);
-    setDialogOpen(false);
-  } catch (err) {
-    console.error("Failed:", err.message);
-  }
-};
-
-<Button onClick={handleCreate} disabled={isLoading}>
-  {isLoading ? <Loader2 className="animate-spin" /> : "Create"}
-</Button>
-```
-
-**Pattern 3: Sequential/batch calls (`useWorkflowMutation`)**
-
-Each `execute()` call is independent — safe to call in a loop.
-
-```tsx
-const { execute } = useWorkflowMutation("process-item-workflow");
-
-const handleBatch = async () => {
-  const results = [];
-  for (const item of items) {
-    const result = await execute({ id: item.id });
-    results.push(result);
-  }
-  setProcessed(results);
-};
-```
-
-**Pattern 4: Conditional loading (`useWorkflowQuery` with `enabled`)**
-
-Delay execution until a condition is met.
-
-```tsx
-const params = useParams();
-const { data, isLoading } = useWorkflowQuery(
-  "get-customer-workflow",
-  { id: params.id },
-  { enabled: !!params.id }
-);
-```
-
-### Guidelines
-
-- Use `useWorkflowQuery` for **reading/loading data** (GET-like operations)
-- Use `useWorkflowMutation` for **user-triggered actions and writes** (POST/PUT/DELETE-like operations)
-- No `useEffect` needed for handling results — `useWorkflowQuery` auto-executes, and `useWorkflowMutation.execute()` returns results directly as a Promise
-
-## Layout Pattern
-
-The root `_layout.tsx` must use `<Outlet />` for routing:
-
-```tsx
-// _layout.tsx - CORRECT
-export default function RootLayout() {
-  return (
-    <div className="h-full bg-background overflow-hidden">
-      <Outlet />
-    </div>
-  );
-}
-```
-
-**Do NOT use `{children}` prop pattern** - it doesn't work with Bifrost routing.
-
-## Scrolling and Layout
-
-For pages with scrollable content, use flex layout with overflow control:
-
-```tsx
-// Page with scrollable table
-export default function MyPage() {
-  return (
-    <div className="flex flex-col h-full p-6 overflow-hidden">
-      {/* Header - fixed */}
-      <div className="shrink-0 mb-4">
-        <h1>Title</h1>
-      </div>
-
-      {/* Content - scrollable */}
-      <Card className="flex flex-col min-h-0 flex-1">
-        <CardHeader className="shrink-0">...</CardHeader>
-        <CardContent className="flex-1 min-h-0 overflow-auto">
-          <Table>...</Table>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-```
-
-Key classes:
-- `h-full overflow-hidden` on layout root
-- `flex flex-col h-full overflow-hidden` on page root
-- `shrink-0` on fixed headers
-- `flex-1 min-h-0 overflow-auto` on scrollable content
-
-## Example Page
-
-```tsx
-// pages/index.tsx - NO IMPORTS NEEDED
-export default function ClientsPage() {
-  // Use workflow ID, not name
-  const clientsWorkflow = useWorkflow("a1b2c3d4-0001-0001-0001-000000000001");
-
-  useEffect(() => {
-    clientsWorkflow.execute();
-  }, []);
-
-  if (clientsWorkflow.loading) {
-    return (
-      <div className="p-8">
-        <Skeleton className="h-8 w-48 mb-4" />
-        <Skeleton className="h-64 w-full" />
-      </div>
-    );
-  }
-
-  const clients = clientsWorkflow.result?.clients || [];
-
-  return (
-    <div className="flex flex-col h-full p-6 overflow-hidden">
-      <h1 className="text-2xl font-bold mb-4 shrink-0">Clients</h1>
-      <Card className="flex flex-col min-h-0 flex-1">
-        <CardContent className="flex-1 min-h-0 overflow-auto p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Email</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {clients.map(client => (
-                <TableRow key={client.id}>
-                  <TableCell>{client.name}</TableCell>
-                  <TableCell>{client.email}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-```
+- `_layout.tsx`: Use `<Outlet />` (not `{children}`) with `h-full overflow-hidden` on root div
+- Scrollable pages: `flex flex-col h-full overflow-hidden` on page root, `shrink-0` on headers, `flex-1 min-h-0 overflow-auto` on scrollable content
 
 """
 
     schema_doc = overview + app_models
     return success_result("App Builder schema documentation", {"schema": schema_doc})
+
+
+async def validate_app(context: Any, app_id: str) -> ToolResult:
+    """
+    Validate application files for common issues.
+
+    Compiles all files and runs static analysis checking for:
+    - Compilation errors (syntax, JSX, TypeScript)
+    - Missing dependencies (imported but not in app.yaml)
+    - Unused dependencies (in app.yaml but not imported)
+    - Unknown components
+    - Invalid workflow IDs
+    - Missing required files (_layout.tsx)
+
+    Args:
+        app_id: Application UUID (required)
+    """
+    import re
+    from uuid import UUID
+
+    from sqlalchemy import select
+
+    from src.core.database import get_db_context
+    from src.models.orm.applications import Application
+    from src.models.orm.file_index import FileIndex
+    from src.models.orm.workflows import Workflow
+    from src.routers.applications import KNOWN_APP_COMPONENTS
+
+    logger.info(f"MCP validate_app called with id={app_id}")
+
+    try:
+        app_uuid = UUID(app_id)
+    except ValueError:
+        return error_result(f"Invalid app_id format: {app_id}")
+
+    try:
+        async with get_db_context() as db:
+            # Get the app
+            result = await db.execute(
+                select(Application).where(Application.id == app_uuid)
+            )
+            app = result.scalar_one_or_none()
+            if not app:
+                return error_result(f"Application not found: {app_id}")
+
+            prefix = f"apps/{app.slug}/"
+
+            # Get all app files
+            fi_result = await db.execute(
+                select(FileIndex.path, FileIndex.content).where(
+                    FileIndex.path.startswith(prefix)
+                )
+            )
+            files = {row.path: row.content or "" for row in fi_result.all()}
+
+            errors: list[dict] = []
+            warnings: list[dict] = []
+
+            # Check required structure
+            if f"{prefix}_layout.tsx" not in files:
+                errors.append({"severity": "error", "file": "_layout.tsx", "message": "Missing required _layout.tsx"})
+            if f"{prefix}pages/index.tsx" not in files:
+                warnings.append({"severity": "warning", "file": "pages/index.tsx", "message": "Missing pages/index.tsx"})
+
+            # Parse declared dependencies from app.yaml
+            from src.routers.app_code_files import _parse_dependencies
+
+            yaml_content = files.get(f"{prefix}app.yaml", "")
+            declared_deps = _parse_dependencies(yaml_content) if yaml_content else {}
+            referenced_deps: set[str] = set()
+
+            # Collect TSX/TS files for compilation
+            compilable_files = []
+            for full_path, content in files.items():
+                rel_path = full_path[len(prefix):]
+                if not (rel_path.endswith(".tsx") or rel_path.endswith(".ts")):
+                    continue
+                compilable_files.append({"path": rel_path, "source": content, "full_path": full_path})
+
+            # Compile all files via the server-side compiler
+            if compilable_files:
+                from src.services.app_compiler import AppCompilerService
+                compiler = AppCompilerService()
+                compile_inputs = [{"path": f["path"], "source": f["source"]} for f in compilable_files]
+                compile_results = await compiler.compile_batch(compile_inputs)
+
+                for comp_file, comp_result in zip(compilable_files, compile_results):
+                    rel_path = comp_file["path"]
+                    content = comp_file["source"]
+
+                    if not comp_result.success:
+                        errors.append({"severity": "error", "file": rel_path, "message": f"Compilation failed: {comp_result.error}"})
+
+                    # Extract external import references (non-bifrost)
+                    for match in re.finditer(
+                        r'^\s*import\s+.*?\s+from\s+["\']([^"\']+)["\']\s*;?\s*$',
+                        content,
+                        re.MULTILINE,
+                    ):
+                        pkg = match.group(1)
+                        if pkg != "bifrost":
+                            # Handle scoped packages: @scope/pkg → @scope/pkg
+                            referenced_deps.add(pkg)
+
+                    # Check unknown components
+                    comp_refs = set(re.findall(r'<([A-Z][a-zA-Z0-9]*)', content))
+                    for comp in comp_refs:
+                        if comp not in KNOWN_APP_COMPONENTS:
+                            warnings.append({"severity": "warning", "file": rel_path, "message": f"Unknown component <{comp}>"})
+
+                    # Check workflow IDs
+                    wf_refs = re.findall(r'(?:useWorkflowQuery|useWorkflowMutation)\s*\(\s*["\']([^"\']+)["\']', content)
+                    for wf_ref in wf_refs:
+                        try:
+                            wf_uuid = UUID(wf_ref)
+                            wf_result = await db.execute(
+                                select(Workflow.id).where(Workflow.id == wf_uuid, Workflow.is_active == True)  # noqa: E712
+                            )
+                            if not wf_result.scalar_one_or_none():
+                                errors.append({"severity": "error", "file": rel_path, "message": f"Workflow '{wf_ref}' not found"})
+                        except ValueError:
+                            errors.append({"severity": "error", "file": rel_path, "message": f"'{wf_ref}' is not a valid UUID"})
+
+            # Check for missing/unused dependencies
+            for dep in referenced_deps:
+                if dep not in declared_deps:
+                    errors.append({"severity": "error", "file": "app.yaml", "message": f"Missing dependency: '{dep}' is imported but not in app.yaml dependencies"})
+            for dep in declared_deps:
+                if dep not in referenced_deps:
+                    warnings.append({"severity": "warning", "file": "app.yaml", "message": f"Unused dependency: '{dep}' is declared but not imported by any file"})
+
+            # Build result
+            lines = []
+            if errors:
+                lines.append(f"Found {len(errors)} error(s):")
+                for e in errors:
+                    line_info = f" (line {e['line']})" if e.get('line') else ""
+                    lines.append(f"  ✗ [{e['file']}{line_info}] {e['message']}")
+            if warnings:
+                lines.append(f"\nFound {len(warnings)} warning(s):")
+                for w in warnings:
+                    lines.append(f"  ⚠ [{w['file']}] {w['message']}")
+            if not errors and not warnings:
+                lines.append("✓ No issues found")
+
+            display_text = "\n".join(lines)
+            return success_result(display_text, {
+                "valid": len(errors) == 0,
+                "errors": errors,
+                "warnings": warnings,
+                "app_name": app.name,
+            })
+
+    except Exception as e:
+        logger.exception(f"Error validating app: {e}")
+        return error_result(f"Error validating app: {str(e)}")
+
+
+async def push_files(
+    context: Any,
+    files: dict[str, str],
+    delete_missing_prefix: str | None = None,
+) -> ToolResult:
+    """
+    Push multiple files to _repo/ in a single batch.
+
+    Useful for creating or updating multiple files at once (e.g., pushing
+    an entire app or workflow set).
+
+    Args:
+        files: Map of repo_path to content, e.g. {"apps/my-app/pages/index.tsx": "..."}
+        delete_missing_prefix: If set, delete files under this prefix not in batch
+    """
+    import hashlib
+
+    from sqlalchemy import select
+
+    from src.core.database import get_db_context
+    from src.models.orm.file_index import FileIndex
+    from src.services.app_storage import AppStorageService
+    from src.services.file_storage import FileStorageService
+
+    logger.info(f"MCP push_files called with {len(files)} file(s)")
+
+    try:
+        async with get_db_context() as db:
+            file_storage = FileStorageService(db)
+            created = 0
+            updated = 0
+            unchanged = 0
+            deleted = 0
+            push_errors: list[str] = []
+
+            for repo_path, content in files.items():
+                try:
+                    existing = await db.execute(
+                        select(FileIndex.content_hash).where(FileIndex.path == repo_path)
+                    )
+                    existing_hash = existing.scalar_one_or_none()
+
+                    content_bytes = content.encode("utf-8")
+                    new_hash = hashlib.sha256(content_bytes).hexdigest()
+
+                    if existing_hash == new_hash:
+                        unchanged += 1
+                        continue
+
+                    was_new = existing_hash is None
+                    await file_storage.write_file(
+                        path=repo_path,
+                        content=content_bytes,
+                        updated_by=str(context.user_id),
+                    )
+
+                    if was_new:
+                        created += 1
+                    else:
+                        updated += 1
+                except Exception as e:
+                    push_errors.append(f"{repo_path}: {str(e)}")
+
+            if delete_missing_prefix:
+                prefix = delete_missing_prefix
+                if not prefix.endswith("/"):
+                    prefix += "/"
+                existing_files = await db.execute(
+                    select(FileIndex.path).where(FileIndex.path.startswith(prefix))
+                )
+                existing_paths = {row[0] for row in existing_files.all()}
+                push_paths = set(files.keys())
+                for path_to_delete in existing_paths - push_paths:
+                    try:
+                        await file_storage.delete_file(path_to_delete)
+                        deleted += 1
+                    except Exception as e:
+                        push_errors.append(f"delete {path_to_delete}: {str(e)}")
+
+            await db.commit()
+
+            # Compile app files that were pushed
+            compile_warnings = []
+            app_file_groups = {}  # group by app slug
+            for repo_path, content in files.items():
+                if repo_path.startswith("apps/") and repo_path.endswith((".tsx", ".ts")):
+                    parts = repo_path.split("/")
+                    if len(parts) >= 3:
+                        slug = parts[1]
+                        rel_path = "/".join(parts[2:])
+                        app_file_groups.setdefault(slug, []).append({
+                            "path": rel_path, "source": content
+                        })
+
+            if app_file_groups:
+                from src.services.app_compiler import AppCompilerService
+                from src.models.orm.applications import Application
+                from src.routers.applications import KNOWN_APP_COMPONENTS
+                import re
+
+                compiler = AppCompilerService()
+                for slug, app_files in app_file_groups.items():
+                    # Get app ID
+                    app_result = await db.execute(
+                        select(Application).where(Application.slug == slug)
+                    )
+                    app = app_result.scalar_one_or_none()
+                    if not app:
+                        continue
+
+                    # Batch compile
+                    results = await compiler.compile_batch(app_files)
+                    app_storage = AppStorageService()
+
+                    for result, file_input in zip(results, app_files):
+                        if result.success and result.compiled:
+                            await app_storage.write_preview_file(
+                                str(app.id), result.path,
+                                result.compiled.encode("utf-8")
+                            )
+                        else:
+                            compile_warnings.append(f"✗ {result.path}: {result.error}")
+
+                        # Check for unknown components
+                        comp_refs = set(re.findall(r'<([A-Z][a-zA-Z0-9]*)', file_input["source"]))
+                        unknown = comp_refs - KNOWN_APP_COMPONENTS
+                        for comp in unknown:
+                            compile_warnings.append(f"⚠ {file_input['path']}: Unknown component <{comp}>")
+
+            parts = []
+            if created:
+                parts.append(f"{created} created")
+            if updated:
+                parts.append(f"{updated} updated")
+            if deleted:
+                parts.append(f"{deleted} deleted")
+            if unchanged:
+                parts.append(f"{unchanged} unchanged")
+
+            summary = ", ".join(parts) if parts else "No changes"
+            display_text = f"Push complete: {summary}"
+            if push_errors:
+                display_text += f"\n\nErrors ({len(push_errors)}):\n" + "\n".join(f"  - {e}" for e in push_errors)
+
+            if compile_warnings:
+                display_text += f"\n\nCompilation ({len(compile_warnings)} issue(s)):\n"
+                display_text += "\n".join(f"  {w}" for w in compile_warnings)
+
+            return success_result(display_text, {
+                "created": created,
+                "updated": updated,
+                "deleted": deleted,
+                "unchanged": unchanged,
+                "errors": push_errors,
+                "compile_warnings": compile_warnings,
+            })
+
+    except Exception as e:
+        logger.exception(f"Error pushing files: {e}")
+        return error_result(f"Error pushing files: {str(e)}")
+
+
+async def get_app_dependencies(
+    context: Any,
+    app_id: str | None = None,
+    app_slug: str | None = None,
+) -> ToolResult:
+    """
+    Get npm dependencies declared in an app's app.yaml.
+
+    Args:
+        app_id: Application UUID
+        app_slug: Application slug (alternative to app_id)
+
+    Returns:
+        ToolResult with dependencies dict {package_name: version}
+    """
+    from uuid import UUID
+
+    from sqlalchemy import select
+
+    from src.core.database import get_db_context
+    from src.models.orm.applications import Application
+    from src.routers.app_code_files import _parse_dependencies
+    from src.services.repo_storage import RepoStorage
+
+    if not app_id and not app_slug:
+        return error_result("Either app_id or app_slug is required")
+
+    try:
+        async with get_db_context() as db:
+            if app_id:
+                try:
+                    app_uuid = UUID(app_id)
+                except ValueError:
+                    return error_result(f"Invalid app_id format: {app_id}")
+                query = select(Application).where(Application.id == app_uuid)
+            else:
+                query = select(Application).where(Application.slug == app_slug)
+
+            if not context.is_platform_admin and context.org_id:
+                query = query.where(
+                    (Application.organization_id == context.org_id)
+                    | (Application.organization_id.is_(None))
+                )
+
+            result = await db.execute(query)
+            app = result.scalar_one_or_none()
+            if not app:
+                return error_result(f"Application not found: {app_id or app_slug}")
+
+            repo = RepoStorage()
+            try:
+                yaml_content = (await repo.read(f"apps/{app.slug}/app.yaml")).decode("utf-8", errors="replace")
+            except Exception:
+                yaml_content = None
+            deps = _parse_dependencies(yaml_content)
+
+            if not deps:
+                return success_result(
+                    f"No dependencies declared for {app.name}",
+                    {"dependencies": {}, "app_id": str(app.id), "app_name": app.name},
+                )
+
+            dep_list = ", ".join(f"{k}@{v}" for k, v in deps.items())
+            return success_result(
+                f"{app.name} dependencies: {dep_list}",
+                {"dependencies": deps, "app_id": str(app.id), "app_name": app.name},
+            )
+
+    except Exception as e:
+        logger.exception(f"Error getting app dependencies: {e}")
+        return error_result(f"Error getting dependencies: {str(e)}")
+
+
+async def update_app_dependencies(
+    context: Any,
+    app_id: str,
+    dependencies: dict[str, str],
+) -> ToolResult:
+    """
+    Update npm dependencies in an app's app.yaml.
+
+    Args:
+        app_id: Application UUID (required)
+        dependencies: Dict of {package_name: version}. Pass empty dict to remove all.
+            Package names: lowercase, hyphens, optional @scope/ prefix.
+            Versions: semver with optional ^ or ~ (e.g., "2.12", "^1.5.3").
+            Max 20 packages.
+
+    Returns:
+        ToolResult with updated dependencies
+    """
+    import re
+    from uuid import UUID
+
+    from sqlalchemy import select
+
+    from src.core.database import get_db_context
+    from src.models.orm.applications import Application
+    from src.routers.app_code_files import _serialize_dependencies
+    from src.services.app_storage import AppStorageService
+    from src.services.file_storage.file_storage_service import get_file_storage_service
+    from src.services.repo_storage import RepoStorage
+
+    MAX_DEPS = 20
+    PKG_NAME_RE = re.compile(r"^(@[a-z0-9-]+/)?[a-z0-9][a-z0-9._-]*$")
+    VERSION_RE = re.compile(r"^\^?~?\d+(\.\d+){0,2}$")
+
+    try:
+        app_uuid = UUID(app_id)
+    except ValueError:
+        return error_result(f"Invalid app_id format: {app_id}")
+
+    if len(dependencies) > MAX_DEPS:
+        return error_result(f"Too many dependencies (max {MAX_DEPS})")
+
+    # Validate
+    for name, version in dependencies.items():
+        if not PKG_NAME_RE.match(name):
+            return error_result(f"Invalid package name: {name}")
+        if not VERSION_RE.match(version):
+            return error_result(f"Invalid version for {name}: {version}")
+
+    try:
+        async with get_db_context() as db:
+            query = select(Application).where(Application.id == app_uuid)
+            if not context.is_platform_admin and context.org_id:
+                query = query.where(
+                    (Application.organization_id == context.org_id)
+                    | (Application.organization_id.is_(None))
+                )
+
+            result = await db.execute(query)
+            app = result.scalar_one_or_none()
+            if not app:
+                return error_result(f"Application not found: {app_id}")
+
+            # Read existing app.yaml
+            yaml_path = f"apps/{app.slug}/app.yaml"
+            repo = RepoStorage()
+            try:
+                existing_yaml = (await repo.read(yaml_path)).decode("utf-8", errors="replace")
+            except Exception:
+                existing_yaml = None
+
+            # Serialize and write
+            new_yaml = _serialize_dependencies(dependencies, existing_yaml)
+            storage = get_file_storage_service(db)
+            user_email = context.user_email or "mcp"
+            await storage.write_file(
+                path=yaml_path,
+                content=new_yaml.encode("utf-8"),
+                updated_by=user_email,
+            )
+
+            # Invalidate render cache
+            app_storage = AppStorageService()
+            await app_storage.invalidate_render_cache(str(app.id))
+
+            if dependencies:
+                dep_list = ", ".join(f"{k}@{v}" for k, v in dependencies.items())
+                display_text = f"Updated {app.name} dependencies: {dep_list}"
+            else:
+                display_text = f"Removed all dependencies from {app.name}"
+
+            return success_result(display_text, {
+                "dependencies": dependencies,
+                "app_id": str(app.id),
+                "app_name": app.name,
+            })
+
+    except Exception as e:
+        logger.exception(f"Error updating app dependencies: {e}")
+        return error_result(f"Error updating dependencies: {str(e)}")
 
 
 # Tool metadata for registration
@@ -741,7 +1212,12 @@ TOOLS = [
     ("get_app", "Get Application", "Get application metadata and file list."),
     ("update_app", "Update Application", "Update application metadata (name, description)."),
     ("publish_app", "Publish Application", "Publish all draft files to live."),
+    ("validate_app", "Validate Application", "Build and validate an app: compiles all files, checks for missing/unused dependencies, unknown components, and bad workflow IDs."),
+    ("push_files", "Push Files", "Push multiple files to _repo/ in a single batch. Useful for creating or updating entire apps or workflow sets."),
     ("get_app_schema", "Get App Schema", "Get documentation about App Builder application structure and code-based files."),
+    ("get_component_docs", "Get Component Docs", "Get detailed UI component documentation (props, variants, examples). Filter by component names or category."),
+    ("get_app_dependencies", "Get App Dependencies", "Get npm dependencies declared in an app's app.yaml."),
+    ("update_app_dependencies", "Update App Dependencies", "Update npm dependencies in an app's app.yaml. Pass a dict of {package: version}."),
 ]
 
 
@@ -755,7 +1231,12 @@ def register_tools(mcp: Any, get_context_fn: Any) -> None:
         "get_app": get_app,
         "update_app": update_app,
         "publish_app": publish_app,
+        "validate_app": validate_app,
+        "push_files": push_files,
         "get_app_schema": get_app_schema,
+        "get_component_docs": get_component_docs,
+        "get_app_dependencies": get_app_dependencies,
+        "update_app_dependencies": update_app_dependencies,
     }
 
     for tool_id, name, description in TOOLS:

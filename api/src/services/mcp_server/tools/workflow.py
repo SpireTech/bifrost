@@ -276,48 +276,13 @@ async def create_workflow(context: Any, file_path: str, code: str) -> ToolResult
             data = {
                 "success": True,
                 "file_path": file_path,
-                "message": "Workflow created and registered.",
+                "message": "Workflow file created. Use register_workflow to register the function.",
             }
             return success_result(f"Workflow created at '{file_path}'", data)
 
     except Exception as e:
         logger.exception(f"Error creating workflow via MCP: {e}")
         return error_result(f"Error creating workflow: {str(e)}")
-
-
-async def get_workflow_schema(context: Any) -> ToolResult:  # noqa: ARG001
-    """Get workflow schema documentation generated from Pydantic models."""
-    from src.models.contracts.workflows import WorkflowMetadata, WorkflowParameter
-    from src.services.mcp_server.schema_utils import models_to_markdown
-
-    # Generate model documentation
-    model_docs = models_to_markdown([
-        (WorkflowMetadata, "WorkflowMetadata (API response)"),
-        (WorkflowParameter, "WorkflowParameter (parameter definition)"),
-    ], "Workflow Schema Documentation")
-
-    # Reference to SDK documentation
-    sdk_reference = """
-## SDK Documentation
-
-For complete SDK documentation including decorators, modules, and examples, use `get_sdk_schema`.
-
-## MCP Tools for Workflows
-
-- `list_workflows` - List all accessible workflows
-- `get_workflow` - Get workflow details by ID or name
-- `execute_workflow` - Execute a workflow with parameters
-- `validate_workflow` - Validate Python file syntax
-- `create_workflow` - Create a new workflow file
-- `get_sdk_schema` - Get full SDK documentation
-"""
-
-    full_docs = model_docs + sdk_reference
-    data = {
-        "documentation": full_docs,
-        "models": ["WorkflowMetadata", "WorkflowParameter"],
-    }
-    return success_result(full_docs, data)
 
 
 async def get_workflow(
@@ -503,7 +468,6 @@ TOOLS = [
     ("list_workflows", "List Workflows", "List workflows registered in Bifrost."),
     ("validate_workflow", "Validate Workflow", "Validate a workflow Python file for syntax and decorator issues."),
     ("create_workflow", "Create Workflow", "Create a new workflow by validating Python code and writing to workspace."),
-    ("get_workflow_schema", "Get Workflow Schema", "Get documentation about workflow structure, decorators, and SDK features."),
     ("get_workflow", "Get Workflow", "Get detailed metadata for a specific workflow by ID or name."),
     ("register_workflow", "Register Workflow", "Register a decorated Python function as a workflow. Takes a file path and function name."),
 ]
@@ -518,7 +482,6 @@ def register_tools(mcp: Any, get_context_fn: Any) -> None:
         "list_workflows": list_workflows,
         "validate_workflow": validate_workflow,
         "create_workflow": create_workflow,
-        "get_workflow_schema": get_workflow_schema,
         "get_workflow": get_workflow,
         "register_workflow": register_workflow,
     }

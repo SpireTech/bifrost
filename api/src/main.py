@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError
 from src.config import get_settings
 from src.models.contracts.common import ErrorResponse
 from src.core.csrf import CSRFMiddleware
+from src.core.embed_middleware import EmbedScopeMiddleware
 from src.core.database import close_db, init_db
 from src.core.pubsub import manager as pubsub_manager
 from src.routers import (
@@ -66,9 +67,13 @@ from src.routers import (
     hooks_router,
     tables_router,
     knowledge_sources_router,
+    app_embed_secrets_router,
     applications_router,
     app_code_files_router,
+    app_render_router,
     dependencies_router,
+    embed_router,
+    form_embed_secrets_router,
     export_import_router,
     platform_workers_router,
     platform_queue_router,
@@ -421,6 +426,9 @@ def create_app() -> FastAPI:
     # Bearer token auth is exempt since browsers don't automatically include it
     app.add_middleware(CSRFMiddleware)
 
+    # Restrict embed tokens to app-rendering endpoints only
+    app.add_middleware(EmbedScopeMiddleware)
+
     # Register routers
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -467,9 +475,13 @@ def create_app() -> FastAPI:
     app.include_router(hooks_router)
     app.include_router(tables_router)
     app.include_router(knowledge_sources_router)
+    app.include_router(app_embed_secrets_router)
     app.include_router(applications_router)
     app.include_router(app_code_files_router)
+    app.include_router(app_render_router)
     app.include_router(dependencies_router)
+    app.include_router(embed_router)
+    app.include_router(form_embed_secrets_router)
     app.include_router(export_import_router)
     app.include_router(platform_workers_router)
     app.include_router(platform_queue_router)

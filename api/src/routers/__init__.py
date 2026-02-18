@@ -43,9 +43,13 @@ from src.routers.events import router as events_router
 from src.routers.hooks import router as hooks_router
 from src.routers.tables import router as tables_router
 from src.routers.knowledge_sources import router as knowledge_sources_router
+from src.routers.app_embed_secrets import router as app_embed_secrets_router
 from src.routers.applications import router as applications_router
 from src.routers.app_code_files import router as app_code_files_router
+from src.routers.app_code_files import render_router as app_render_router
 from src.routers.dependencies import router as dependencies_router
+from src.routers.embed import router as embed_router
+from src.routers.form_embed_secrets import router as form_embed_secrets_router
 from src.routers.export_import import router as export_import_router
 from src.routers.jobs import router as jobs_router
 from src.routers.platform import (
@@ -99,9 +103,13 @@ __all__ = [
     "hooks_router",
     "tables_router",
     "knowledge_sources_router",
+    "app_embed_secrets_router",
     "applications_router",
     "app_code_files_router",
+    "app_render_router",
     "dependencies_router",
+    "embed_router",
+    "form_embed_secrets_router",
     "export_import_router",
     "jobs_router",
     "platform_workers_router",

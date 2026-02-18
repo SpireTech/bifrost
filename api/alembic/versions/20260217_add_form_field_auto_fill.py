@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260217_auto_fill"
-down_revision = "20260212_drop_old_app_tables"
+down_revision = "20260218_is_system_users"
 branch_labels = None
 depends_on = None
 

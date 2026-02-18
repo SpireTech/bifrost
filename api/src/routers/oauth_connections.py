@@ -238,6 +238,8 @@ class OAuthConnectionRepository:
 
         if request.name is not None:
             provider.display_name = request.name
+        if request.oauth_flow_type is not None:
+            provider.oauth_flow_type = request.oauth_flow_type
         if request.client_id is not None:
             provider.client_id = request.client_id
         if request.client_secret is not None:
@@ -250,6 +252,8 @@ class OAuthConnectionRepository:
             provider.token_url = request.token_url
         if request.scopes is not None:
             provider.scopes = request.scopes
+        if request.audience is not None:
+            provider.audience = request.audience
 
         provider.updated_at = datetime.now(timezone.utc)
 
@@ -417,6 +421,7 @@ class OAuthConnectionRepository:
             authorization_url=provider.authorization_url,
             token_url=provider.token_url or "",
             scopes=scopes_str,
+            audience=provider.audience,
             status=status,
             status_message=provider.status_message,
             integration_id=str(provider.integration_id) if provider.integration_id else None,
@@ -536,6 +541,7 @@ async def create_connection(
         authorization_url=request.authorization_url,
         token_url=request.token_url,
         scopes=request.scopes.split(",") if request.scopes else [],
+        audience=request.audience,
         status="not_connected",
         created_by=ctx.user.email,
         integration_id=integration_id,
@@ -795,6 +801,7 @@ async def refresh_token(
             client_id=provider.client_id,
             client_secret=client_secret,
             scopes=scopes,
+            audience=provider.audience,
         )
 
         if not success:
@@ -854,6 +861,7 @@ async def refresh_token(
             refresh_token=refresh_token_value,
             client_id=provider.client_id,
             client_secret=client_secret,
+            audience=provider.audience,
         )
 
         if not success:
@@ -961,6 +969,7 @@ async def oauth_callback(
         client_id=provider.client_id,
         client_secret=client_secret,
         redirect_uri=redirect_uri,
+        audience=provider.audience,
     )
 
     if not success:

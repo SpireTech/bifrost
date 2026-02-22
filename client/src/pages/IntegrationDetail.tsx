@@ -31,12 +31,12 @@ import {
 import { toast } from "sonner";
 import {
 	useIntegration,
-	useCreateMapping,
 	useUpdateMapping,
 	useDeleteMapping,
 	useUpdateIntegration,
 	useUpdateIntegrationConfig,
 	useTestIntegration,
+	useBatchUpsertMappings,
 	type IntegrationTestResponse,
 } from "@/services/integrations";
 import { $api } from "@/lib/api-client";
@@ -104,7 +104,6 @@ export function IntegrationDetail() {
 		"/api/organizations",
 	);
 
-	const createMutation = useCreateMapping();
 	const updateMutation = useUpdateMapping();
 	const deleteMutation = useDeleteMapping();
 	const updateIntegrationMutation = useUpdateIntegration();
@@ -113,6 +112,7 @@ export function IntegrationDetail() {
 	const refreshMutation = useRefreshOAuthToken();
 	const deleteOAuthMutation = useDeleteOAuthConnection();
 	const testMutation = useTestIntegration();
+	const batchMutation = useBatchUpsertMappings();
 
 	// Memoize to stabilize references for the useEffect that combines them
 	const organizations = useMemo(
@@ -284,63 +284,6 @@ export function IntegrationDetail() {
 		});
 	};
 
-	const handleSaveMapping = async (org: OrgWithMapping) => {
-		if (!integrationId) return;
-
-		try {
-			if (org.mapping) {
-				// Update existing mapping
-				await updateMutation.mutateAsync({
-					params: {
-						path: {
-							integration_id: integrationId,
-							mapping_id: org.mapping.id,
-						},
-					},
-					body: {
-						entity_id: org.formData.entity_id,
-						entity_name: org.formData.entity_name || undefined,
-						oauth_token_id:
-							org.formData.oauth_token_id || undefined,
-						config:
-							Object.keys(org.formData.config).length > 0
-								? org.formData.config
-								: undefined,
-					},
-				});
-				toast.success(`Mapping updated for ${org.name}`);
-			} else {
-				// Create new mapping
-				await createMutation.mutateAsync({
-					params: { path: { integration_id: integrationId } },
-					body: {
-						organization_id: org.id,
-						entity_id: org.formData.entity_id,
-						entity_name: org.formData.entity_name || undefined,
-						oauth_token_id:
-							org.formData.oauth_token_id || undefined,
-						config:
-							Object.keys(org.formData.config).length > 0
-								? org.formData.config
-								: undefined,
-					},
-				});
-				toast.success(`Mapping created for ${org.name}`);
-			}
-
-			// Mark as not dirty (remove from dirty edits)
-			setDirtyEdits((prev) => {
-				const next = new Map(prev);
-				next.delete(org.id);
-				return next;
-			});
-			// Cache invalidation in useCreateMapping/useUpdateMapping handles refetch
-		} catch (error) {
-			console.error("Failed to save mapping:", error);
-			toast.error(`Failed to save mapping for ${org.name}`);
-		}
-	};
-
 	const handleDeleteMappingClick = (org: OrgWithMapping) => {
 		setDeleteMappingConfirm(org);
 	};
@@ -444,25 +387,37 @@ export function IntegrationDetail() {
 
 		setIsSavingAll(true);
 		try {
-			let successCount = 0;
-			let errorCount = 0;
+			const result = await batchMutation.mutateAsync({
+				params: { path: { integration_id: integrationId! } },
+				body: {
+					mappings: dirtyMappings.map((org) => ({
+						organization_id: org.id,
+						entity_id: org.formData.entity_id,
+						entity_name: org.formData.entity_name || undefined,
+					})),
+				},
+			});
 
-			for (const org of dirtyMappings) {
-				try {
-					await handleSaveMapping(org);
-					successCount++;
-				} catch {
-					errorCount++;
+			// Clear dirty state for all saved mappings
+			setDirtyEdits((prev) => {
+				const next = new Map(prev);
+				for (const org of dirtyMappings) {
+					next.delete(org.id);
 				}
-			}
+				return next;
+			});
 
+			const total = result.created + result.updated;
+			const errorCount = result.errors?.length ?? 0;
 			if (errorCount === 0) {
-				toast.success(`Saved ${successCount} mapping(s)`);
+				toast.success(`Saved ${total} mapping(s)`);
 			} else {
 				toast.warning(
-					`Saved ${successCount} mapping(s), ${errorCount} failed`,
+					`Saved ${total} mapping(s), ${errorCount} failed`,
 				);
 			}
+		} catch {
+			toast.error("Failed to save mappings");
 		} finally {
 			setIsSavingAll(false);
 		}

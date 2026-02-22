@@ -158,6 +158,7 @@ class RegisterWorkflowRequest(BaseModel):
     """Request model for explicit workflow registration."""
     path: str = Field(..., description="Workspace-relative path to the .py file")
     function_name: str = Field(..., description="Name of the decorated function to register")
+    organization_id: str | None = Field(default=None, description="Organization ID to scope the workflow to, or null for global scope")
 
 
 class RegisterWorkflowResponse(BaseModel):
@@ -168,6 +169,7 @@ class RegisterWorkflowResponse(BaseModel):
     path: str = Field(..., description="File path")
     type: str = Field(..., description="Executable type: workflow, tool, or data_provider")
     description: str | None = Field(default=None, description="Workflow description")
+    organization_id: str | None = Field(default=None, description="Organization ID if org-scoped, null for global")
 
 
 # ==================== WORKFLOW VALIDATION ====================
@@ -214,7 +216,7 @@ class WorkflowKey(BaseModel):
 
 class WorkflowKeyCreateRequest(BaseModel):
     """Request model for creating a workflow API key"""
-    workflow_name: str | None = Field(default=None, description="Workflow-specific key, or None for global")
+    workflow_id: str | None = Field(default=None, description="Workflow UUID for workflow-specific key")
     expires_in_days: int | None = Field(default=None, description="Days until key expires (default: no expiration)")
     description: str | None = Field(default=None, description="Optional key description")
     disable_global_key: bool = Field(default=False, description="If true, workflow opts out of global API keys")
@@ -225,6 +227,7 @@ class WorkflowKeyResponse(BaseModel):
     id: str
     raw_key: str | None = Field(default=None, description="Raw API key (only returned on creation)")
     masked_key: str | None = Field(default=None, description="Last 4 characters for display")
+    workflow_id: str | None = None
     workflow_name: str | None = None
     created_by: str
     created_at: datetime

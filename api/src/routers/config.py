@@ -18,6 +18,7 @@ from src.models import (
     ConfigResponse,
     ConfigType,
     SetConfigRequest,
+    UpdateConfigRequest,
 )
 
 from src.core.auth import Context, CurrentSuperuser
@@ -62,40 +63,48 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
         self,
         filter_type: OrgFilterType = OrgFilterType.ORG_PLUS_GLOBAL,
     ) -> list[ConfigResponse]:
-        """List configs with specified filter type.
+        """List configs with specified filter type."""
+        from src.models.orm.integrations import Integration
+        from sqlalchemy import and_
 
-        Args:
-            filter_type: How to filter by organization scope
-
-        Filter types:
-            - ALL: No filter, show everything (superuser only)
-            - GLOBAL_ONLY: Only org_id IS NULL
-            - ORG_ONLY: Only specific org, NO global fallback
-            - ORG_PLUS_GLOBAL: Specific org + global records (cascade scoping)
-        """
-        query = select(self.model)
+        query = select(self.model, Integration.name.label("integration_name")).outerjoin(
+            Integration,
+            and_(
+                self.model.integration_id == Integration.id,
+                Integration.is_deleted.is_(False),
+            )
+        )
 
         # Apply filter based on filter_type
         if filter_type == OrgFilterType.ALL:
-            # No filter - superuser sees everything
             pass
         elif filter_type == OrgFilterType.GLOBAL_ONLY:
-            # Only global configs
             query = query.where(self.model.organization_id.is_(None))
         elif filter_type == OrgFilterType.ORG_ONLY:
-            # Only specific org, no global fallback
             query = query.where(self.model.organization_id == self.org_id)
         else:
-            # ORG_PLUS_GLOBAL - use cascade scoping from base class
-            query = self._apply_cascade_scope(query)
+            # Inline cascade scope to avoid type mismatch with joined query
+            from sqlalchemy import or_
+            if self.org_id is not None:
+                query = query.where(
+                    or_(
+                        self.model.organization_id == self.org_id,
+                        self.model.organization_id.is_(None),
+                    )
+                )
+            else:
+                query = query.where(self.model.organization_id.is_(None))
 
         query = query.order_by(self.model.key)
 
         result = await self.session.execute(query)
-        configs = result.scalars().all()
+        rows = result.all()
 
         schemas = []
-        for c in configs:
+        for row in rows:
+            c = row[0]  # ConfigModel
+            integration_name = row[1]  # Integration.name or None
+
             raw_value = c.value.get("value") if isinstance(c.value, dict) else c.value
             # Mask secret values in list responses
             if c.config_type == ConfigTypeEnum.SECRET:
@@ -111,6 +120,8 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
                     type=ConfigType(c.config_type.value) if c.config_type else ConfigType.STRING,
                     scope="org" if c.organization_id else "GLOBAL",
                     org_id=str(c.organization_id) if c.organization_id else None,
+                    integration_id=str(c.integration_id) if c.integration_id else None,
+                    integration_name=integration_name,
                     description=c.description,
                     updated_at=c.updated_at,
                     updated_by=c.updated_by,
@@ -199,6 +210,71 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
             updated_by=config.updated_by,
         )
 
+    async def update_config_by_id(
+        self,
+        config_id: UUID,
+        request: UpdateConfigRequest,
+        updated_by: str,
+    ) -> ConfigResponse | None:
+        """Update a config by ID. Allows changing organization scope.
+
+        For SECRET type configs, if value is None or empty string, the existing
+        encrypted value is preserved.
+        """
+        query = select(self.model).where(self.model.id == config_id)
+        result = await self.session.execute(query)
+        config = result.scalar_one_or_none()
+        if not config:
+            return None
+
+        now = datetime.now(timezone.utc)
+
+        # Determine the effective type (use request type if provided, else keep existing)
+        effective_type = request.type if request.type is not None else (
+            ConfigType(config.config_type.value) if config.config_type else ConfigType.STRING
+        )
+
+        # Handle value update — for secrets, empty/None means keep existing
+        if request.value is not None and request.value != "":
+            stored_value = request.value
+            if effective_type == ConfigType.SECRET:
+                from src.core.security import encrypt_secret
+                stored_value = encrypt_secret(request.value)
+            config.value = {"value": stored_value}
+        elif effective_type != ConfigType.SECRET:
+            # Non-secret types: empty string is a valid value, None means no change
+            if request.value is not None:
+                config.value = {"value": request.value}
+
+        if request.key is not None:
+            config.key = request.key
+        if request.type is not None:
+            config.config_type = ConfigTypeEnum(request.type.value)
+        if "description" in (request.model_fields_set or set()):
+            config.description = request.description
+        if "organization_id" in (request.model_fields_set or set()):
+            config.organization_id = request.organization_id
+        config.updated_at = now
+        config.updated_by = updated_by
+        await self.session.flush()
+        await self.session.refresh(config)
+
+        logger.info(f"Updated config {config.key} (id={config_id}) org={config.organization_id}")
+
+        response_type = ConfigType(config.config_type.value) if config.config_type else ConfigType.STRING
+        stored_value = config.value.get("value") if isinstance(config.value, dict) else config.value
+        return ConfigResponse(
+            id=config.id,
+            key=config.key,
+            value=stored_value,
+            type=response_type,
+            scope="org" if config.organization_id else "GLOBAL",
+            org_id=str(config.organization_id) if config.organization_id else None,
+            description=config.description,
+            updated_at=config.updated_at,
+            updated_by=config.updated_by,
+        )
+
     async def delete_config(self, config_id: UUID) -> ConfigModel | None:
         """Delete config by ID. Returns the deleted config or None if not found."""
         query = select(self.model).where(self.model.id == config_id)
@@ -267,22 +343,33 @@ async def set_config(
     user: CurrentSuperuser,
     scope: str | None = Query(
         default=None,
-        description="Target scope: 'global' for global config, or org UUID for org-specific config. "
+        description="Deprecated: use organization_id in the request body instead. "
+        "Target scope: 'global' for global config, or org UUID for org-specific config. "
         "If omitted, uses the user's current organization context.",
     ),
 ) -> ConfigResponse:
     """Set a configuration key-value pair.
 
-    Superusers can specify a scope to create configs in a specific organization
-    or explicitly create global configs.
+    Superusers can specify organization_id in the request body to target a
+    specific organization, or set it to null for global configs.
+    The scope query param is supported for backward compatibility.
     """
-    try:
-        target_org_id = resolve_target_org(ctx.user, scope, ctx.org_id)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
+    # Prefer organization_id from request body; fall back to scope query param
+    if scope is not None:
+        # Legacy: scope query param takes precedence if explicitly provided
+        try:
+            target_org_id = resolve_target_org(ctx.user, scope, ctx.org_id)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(e),
+            )
+    elif "organization_id" in (request.model_fields_set or set()):
+        # Body explicitly included organization_id (even if null → global)
+        target_org_id = request.organization_id
+    else:
+        # Neither provided — default to user's current org
+        target_org_id = ctx.org_id
 
     # Config endpoints are superuser-only, so is_superuser=True (no role checks)
     repo = ConfigRepository(ctx.db, org_id=target_org_id, is_superuser=True)
@@ -305,6 +392,46 @@ async def set_config(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to set configuration",
         )
+
+
+@router.put(
+    "/api/config/{config_id}",
+    response_model=ConfigResponse,
+    summary="Update configuration value by ID",
+    description="Update an existing configuration value, including its organization scope",
+)
+async def update_config(
+    config_id: UUID,
+    request: UpdateConfigRequest,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> ConfigResponse:
+    """Update a configuration by ID.
+
+    Unlike POST (which upserts by key within an org scope), this updates the
+    specific config row by ID — allowing changes to organization_id (scope).
+
+    For SECRET type configs, omit value or send empty string to keep the
+    existing encrypted value.
+    """
+    # Use is_superuser=True; org scoping not needed since we look up by ID
+    repo = ConfigRepository(ctx.db, org_id=ctx.org_id, is_superuser=True)
+
+    result = await repo.update_config_by_id(config_id, request, updated_by=user.email)
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Configuration not found",
+        )
+
+    # Upsert to cache after successful write
+    if CACHE_AVAILABLE and upsert_config:
+        org_id_str = str(result.org_id) if result.org_id else None
+        config_type_str = result.type.value if result.type else "string"
+        stored_value = result.value
+        await upsert_config(org_id_str, result.key, stored_value, config_type_str)
+
+    return result
 
 
 @router.delete(

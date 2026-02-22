@@ -2079,7 +2079,11 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /**
+         * Update configuration value by ID
+         * @description Update an existing configuration value, including its organization scope
+         */
+        put: operations["update_config_api_config__config_id__put"];
         post?: never;
         /**
          * Delete configuration value
@@ -3301,7 +3305,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/endpoints/{workflow_name}": {
+    "/api/endpoints/{workflow_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -3312,22 +3316,22 @@ export interface paths {
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        get: operations["execute_endpoint_api_endpoints__workflow_name__put"];
+        get: operations["execute_endpoint_api_endpoints__workflow_id__get"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        put: operations["execute_endpoint_api_endpoints__workflow_name__put"];
+        put: operations["execute_endpoint_api_endpoints__workflow_id__get"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        post: operations["execute_endpoint_api_endpoints__workflow_name__put"];
+        post: operations["execute_endpoint_api_endpoints__workflow_id__get"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        delete: operations["execute_endpoint_api_endpoints__workflow_name__put"];
+        delete: operations["execute_endpoint_api_endpoints__workflow_id__get"];
         options?: never;
         head?: never;
         patch?: never;
@@ -4920,6 +4924,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/integrations/{integration_id}/mappings/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Batch upsert integration mappings
+         * @description Create or update multiple mappings in a single request (Platform admin only)
+         */
+        post: operations["batch_upsert_mappings_api_integrations__integration_id__mappings_batch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/integrations/{integration_id}/oauth": {
         parameters: {
             query?: never;
@@ -5742,7 +5766,7 @@ export interface paths {
         post?: never;
         /**
          * Delete event source
-         * @description Soft delete an event source (Platform admin only).
+         * @description Soft delete (deactivate) an event source (Platform admin only).
          */
         delete: operations["delete_source_api_events_sources__source_id__delete"];
         options?: never;
@@ -6572,15 +6596,14 @@ export interface paths {
         };
         /**
          * Get app dependencies
-         * @description Return the validated dependencies dict from app.yaml.
+         * @description Return the app's npm dependencies.
          */
         get: operations["get_dependencies_api_applications__app_id__dependencies_get"];
         /**
          * Update app dependencies
-         * @description Replace the dependencies section of app.yaml.
+         * @description Replace the app's npm dependencies.
          *
-         *     Validates every package name and version, enforces the max-dependency
-         *     limit, then writes back to app.yaml preserving other fields.
+         *     Validates every package name and version, enforces the max-dependency limit.
          */
         put: operations["put_dependencies_api_applications__app_id__dependencies_put"];
         post?: never;
@@ -7642,7 +7665,7 @@ export interface components {
             total: number;
             /**
              * Dependencies
-             * @description npm dependencies from app.yaml {name: version} for esm.sh loading
+             * @description npm dependencies {name: version} for esm.sh loading
              */
             dependencies?: {
                 [key: string]: string;
@@ -8938,6 +8961,16 @@ export interface components {
              * @description Organization ID (only for org-specific config)
              */
             org_id?: string | null;
+            /**
+             * Integration Id
+             * @description Integration ID (if config is managed by an integration)
+             */
+            integration_id?: string | null;
+            /**
+             * Integration Name
+             * @description Integration name (if config is managed by an integration)
+             */
+            integration_name?: string | null;
             /** Description */
             description?: string | null;
             /** Updated At */
@@ -12136,6 +12169,60 @@ export interface components {
              * @description Total number of integrations
              */
             total: number;
+        };
+        /**
+         * IntegrationMappingBatchItem
+         * @description A single mapping in a batch upsert request.
+         */
+        IntegrationMappingBatchItem: {
+            /**
+             * Organization Id
+             * Format: uuid
+             * @description Organization ID to map
+             */
+            organization_id: string;
+            /**
+             * Entity Id
+             * @description External entity ID
+             */
+            entity_id: string;
+            /**
+             * Entity Name
+             * @description Display name for the external entity
+             */
+            entity_name?: string | null;
+        };
+        /**
+         * IntegrationMappingBatchRequest
+         * @description Batch upsert request for integration mappings.
+         */
+        IntegrationMappingBatchRequest: {
+            /**
+             * Mappings
+             * @description List of mappings to create or update
+             */
+            mappings: components["schemas"]["IntegrationMappingBatchItem"][];
+        };
+        /**
+         * IntegrationMappingBatchResponse
+         * @description Response from batch mapping upsert.
+         */
+        IntegrationMappingBatchResponse: {
+            /**
+             * Created
+             * @description Number of new mappings created
+             */
+            created: number;
+            /**
+             * Updated
+             * @description Number of existing mappings updated
+             */
+            updated: number;
+            /**
+             * Errors
+             * @description Error messages for failed items
+             */
+            errors?: string[];
         };
         /**
          * IntegrationMappingCreate
@@ -16235,6 +16322,11 @@ export interface components {
              * @description Optional description of this config entry
              */
             description?: string | null;
+            /**
+             * Organization Id
+             * @description Organization ID. Null for global config.
+             */
+            organization_id?: string | null;
         };
         /**
          * SetupPasskeyOptionsRequest
@@ -16696,6 +16788,33 @@ export interface components {
         TrustedDevicesResponse: {
             /** Devices */
             devices: components["schemas"]["TrustedDeviceResponse"][];
+        };
+        /**
+         * UpdateConfigRequest
+         * @description Request model for updating an existing config by ID.
+         *
+         *     All fields are optional. For SECRET type configs, omitting value (or sending
+         *     empty string) preserves the existing encrypted value.
+         */
+        UpdateConfigRequest: {
+            /** Key */
+            key?: string | null;
+            /**
+             * Value
+             * @description Config value. For SECRET type, leave empty to keep existing value.
+             */
+            value?: string | null;
+            type?: components["schemas"]["ConfigType"] | null;
+            /**
+             * Description
+             * @description Optional description of this config entry
+             */
+            description?: string | null;
+            /**
+             * Organization Id
+             * @description Organization ID. Null for global config.
+             */
+            organization_id?: string | null;
         };
         /**
          * UpdateOAuthConnectionRequest
@@ -17410,10 +17529,10 @@ export interface components {
          */
         WorkflowKeyCreateRequest: {
             /**
-             * Workflow Name
-             * @description Workflow-specific key, or None for global
+             * Workflow Id
+             * @description Workflow UUID for workflow-specific key
              */
-            workflow_name?: string | null;
+            workflow_id?: string | null;
             /**
              * Expires In Days
              * @description Days until key expires (default: no expiration)
@@ -17448,6 +17567,8 @@ export interface components {
              * @description Last 4 characters for display
              */
             masked_key?: string | null;
+            /** Workflow Id */
+            workflow_id?: string | null;
             /** Workflow Name */
             workflow_name?: string | null;
             /** Created By */
@@ -17489,6 +17610,8 @@ export interface components {
              * @description Last 4 characters for display
              */
             masked_key?: string | null;
+            /** Workflow Id */
+            workflow_id?: string | null;
             /** Workflow Name */
             workflow_name?: string | null;
             /** Created By */
@@ -21153,7 +21276,7 @@ export interface operations {
     set_config_api_config_post: {
         parameters: {
             query?: {
-                /** @description Target scope: 'global' for global config, or org UUID for org-specific config. If omitted, uses the user's current organization context. */
+                /** @description Deprecated: use organization_id in the request body instead. Target scope: 'global' for global config, or org UUID for org-specific config. If omitted, uses the user's current organization context. */
                 scope?: string | null;
             };
             header?: never;
@@ -21168,6 +21291,41 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_config_api_config__config_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                config_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateConfigRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21881,7 +22039,9 @@ export interface operations {
     };
     list_keys_api_workflow_keys_get: {
         parameters: {
-            query?: never;
+            query?: {
+                workflow_id?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -21895,6 +22055,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkflowKeyResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -23210,14 +23379,14 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_name__put: {
+    execute_endpoint_api_endpoints__workflow_id__get: {
         parameters: {
             query?: never;
             header: {
                 "X-Bifrost-Key": string;
             };
             path: {
-                workflow_name: string;
+                workflow_id: string;
             };
             cookie?: never;
         };
@@ -23243,14 +23412,14 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_name__put: {
+    execute_endpoint_api_endpoints__workflow_id__get: {
         parameters: {
             query?: never;
             header: {
                 "X-Bifrost-Key": string;
             };
             path: {
-                workflow_name: string;
+                workflow_id: string;
             };
             cookie?: never;
         };
@@ -23276,14 +23445,14 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_name__put: {
+    execute_endpoint_api_endpoints__workflow_id__get: {
         parameters: {
             query?: never;
             header: {
                 "X-Bifrost-Key": string;
             };
             path: {
-                workflow_name: string;
+                workflow_id: string;
             };
             cookie?: never;
         };
@@ -23309,14 +23478,14 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_name__put: {
+    execute_endpoint_api_endpoints__workflow_id__get: {
         parameters: {
             query?: never;
             header: {
                 "X-Bifrost-Key": string;
             };
             path: {
-                workflow_name: string;
+                workflow_id: string;
             };
             cookie?: never;
         };
@@ -26211,6 +26380,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IntegrationMappingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    batch_upsert_mappings_api_integrations__integration_id__mappings_batch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                integration_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IntegrationMappingBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IntegrationMappingBatchResponse"];
                 };
             };
             /** @description Validation Error */

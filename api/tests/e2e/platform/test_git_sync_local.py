@@ -323,7 +323,7 @@ async def cleanup_test_data(db_session: AsyncSession):
         delete(EventSource).where(EventSource.created_by == "git-sync")
     )
     await db_session.execute(
-        delete(Config).where(Config.updated_by == "git-sync")
+        delete(Config).where(Config.updated_by.in_(["git-sync", "test"]))
     )
     await db_session.execute(
         delete(IntegrationConfigSchema).where(
@@ -340,9 +340,23 @@ async def cleanup_test_data(db_session: AsyncSession):
         )
     )
     await db_session.execute(
+        delete(IntegrationConfigSchema).where(
+            IntegrationConfigSchema.integration_id.in_(
+                select(Integration.id).where(Integration.name.like("%TestInteg"))
+            )
+        )
+    )
+    await db_session.execute(
         delete(IntegrationMapping).where(
             IntegrationMapping.integration_id.in_(
                 select(Integration.id).where(Integration.name.like("Test%"))
+            )
+        )
+    )
+    await db_session.execute(
+        delete(IntegrationMapping).where(
+            IntegrationMapping.integration_id.in_(
+                select(Integration.id).where(Integration.name.like("%TestInteg"))
             )
         )
     )
@@ -353,13 +367,16 @@ async def cleanup_test_data(db_session: AsyncSession):
         delete(Integration).where(Integration.name.like("Idempotent%"))
     )
     await db_session.execute(
+        delete(Integration).where(Integration.name.like("%TestInteg"))
+    )
+    await db_session.execute(
         delete(Table).where(Table.created_by == "git-sync")
     )
 
     # Clean up orgs and roles last (entities FK into these)
     from src.models.orm.organizations import Organization
     from src.models.orm.users import Role
-    await db_session.execute(delete(Organization).where(Organization.created_by == "git-sync"))
+    await db_session.execute(delete(Organization).where(Organization.created_by.in_(["git-sync", "test"])))
     await db_session.execute(delete(Role).where(Role.created_by == "git-sync"))
     await db_session.commit()
 
@@ -2218,6 +2235,259 @@ class TestSplitManifestFormat:
         assert wf is not None
         assert wf.name == "Legacy Test Workflow"
 
+    async def test_pull_integration_preserves_config_values(
+        self,
+        db_session: AsyncSession,
+        sync_service,
+        working_clone,
+    ):
+        """Pulling integration manifest preserves existing Config values
+        that reference IntegrationConfigSchema rows."""
+        from uuid import UUID as UUIDType
+
+        from src.models.orm.config import Config
+        from src.models.orm.integrations import IntegrationConfigSchema
+
+        work_dir = Path(working_clone.working_dir)
+        integ_id = str(uuid4())
+
+        # First pull: create integration with config schema
+        bifrost_dir = work_dir / ".bifrost"
+        bifrost_dir.mkdir(exist_ok=True)
+        (bifrost_dir / "integrations.yaml").write_text(yaml.dump({
+            "integrations": {
+                "ConfigTestInteg": {
+                    "id": integ_id,
+                    "config_schema": [
+                        {"key": "api_url", "type": "string", "required": True, "position": 0},
+                        {"key": "api_key", "type": "secret", "required": True, "position": 1},
+                    ],
+                },
+            },
+        }, default_flow_style=False))
+
+        working_clone.index.add([".bifrost/integrations.yaml"])
+        working_clone.index.commit("add integration")
+        working_clone.remotes.origin.push()
+
+        result = await sync_service.desktop_pull()
+        assert result.success is True
+
+        # Manually create Config values (simulating user setting values in UI)
+        cs_result = await db_session.execute(
+            select(IntegrationConfigSchema).where(
+                IntegrationConfigSchema.integration_id == UUIDType(integ_id)
+            )
+        )
+        schemas = {cs.key: cs for cs in cs_result.scalars().all()}
+
+        config_api_url = Config(
+            integration_id=UUIDType(integ_id),
+            organization_id=None,
+            key="api_url",
+            value={"value": "https://my-instance.example.com"},
+            config_type="string",
+            config_schema_id=schemas["api_url"].id,
+            updated_by="test",
+        )
+        config_api_key = Config(
+            integration_id=UUIDType(integ_id),
+            organization_id=None,
+            key="api_key",
+            value={"value": "super-secret-key-encrypted"},
+            config_type="secret",
+            config_schema_id=schemas["api_key"].id,
+            updated_by="test",
+        )
+        db_session.add_all([config_api_url, config_api_key])
+        await db_session.commit()
+
+        # Second pull: same manifest — config values must survive
+        (work_dir / ".bifrost" / "trigger.txt").write_text("trigger re-sync")
+        working_clone.index.add([".bifrost/trigger.txt"])
+        working_clone.index.commit("trigger re-sync")
+        working_clone.remotes.origin.push()
+
+        result2 = await sync_service.desktop_pull()
+        assert result2.success is True
+
+        # Verify Config values still exist
+        db_session.expire_all()
+        cfg_result = await db_session.execute(
+            select(Config).where(Config.integration_id == UUIDType(integ_id))
+        )
+        configs = {c.key: c for c in cfg_result.scalars().all()}
+        assert "api_url" in configs, "api_url Config was destroyed by sync"
+        assert configs["api_url"].value == {"value": "https://my-instance.example.com"}
+        assert "api_key" in configs, "api_key Config was destroyed by sync"
+        assert configs["api_key"].value == {"value": "super-secret-key-encrypted"}
+
+    async def test_pull_integration_preserves_mapping_identity(
+        self,
+        db_session: AsyncSession,
+        sync_service,
+        working_clone,
+    ):
+        """Pulling integration manifest preserves existing mapping rows (upsert, not recreate)."""
+        from uuid import UUID as UUIDType
+
+        from src.models.orm.integrations import IntegrationMapping
+        from src.models.orm.organizations import Organization
+
+        work_dir = Path(working_clone.working_dir)
+        integ_id = str(uuid4())
+        org_id = str(uuid4())
+
+        # Create org in DB (needed for FK)
+        org = Organization(id=UUIDType(org_id), name="MappingTestOrg", created_by="test")
+        db_session.add(org)
+        await db_session.commit()
+
+        # First pull: create integration with mapping
+        bifrost_dir = work_dir / ".bifrost"
+        bifrost_dir.mkdir(exist_ok=True)
+        (bifrost_dir / "integrations.yaml").write_text(yaml.dump({
+            "integrations": {
+                "MappingTestInteg": {
+                    "id": integ_id,
+                    "mappings": [
+                        {"organization_id": org_id, "entity_id": "tenant-1"},
+                    ],
+                },
+            },
+        }, default_flow_style=False))
+
+        working_clone.index.add([".bifrost/integrations.yaml"])
+        working_clone.index.commit("add integration")
+        working_clone.remotes.origin.push()
+
+        result = await sync_service.desktop_pull()
+        assert result.success is True
+
+        # Get original mapping row ID
+        mapping_result = await db_session.execute(
+            select(IntegrationMapping).where(
+                IntegrationMapping.integration_id == UUIDType(integ_id)
+            )
+        )
+        mapping = mapping_result.scalar_one()
+        original_mapping_id = mapping.id
+
+        # Second pull: same manifest
+        (work_dir / ".bifrost" / "trigger.txt").write_text("trigger re-sync")
+        working_clone.index.add([".bifrost/trigger.txt"])
+        working_clone.index.commit("trigger re-sync")
+        working_clone.remotes.origin.push()
+
+        result2 = await sync_service.desktop_pull()
+        assert result2.success is True
+
+        # Verify mapping was preserved (not deleted + re-created)
+        db_session.expire_all()
+        mapping_result2 = await db_session.execute(
+            select(IntegrationMapping).where(
+                IntegrationMapping.integration_id == UUIDType(integ_id)
+            )
+        )
+        mapping2 = mapping_result2.scalar_one()
+        assert mapping2.entity_id == "tenant-1"
+        assert mapping2.id == original_mapping_id, "Mapping was recreated instead of upserted"
+
+    async def test_pull_integration_schema_key_add_remove(
+        self,
+        db_session: AsyncSession,
+        sync_service,
+        working_clone,
+    ):
+        """Adding/removing config schema keys via manifest works correctly."""
+        from uuid import UUID as UUIDType
+
+        from src.models.orm.config import Config
+        from src.models.orm.integrations import IntegrationConfigSchema
+
+        work_dir = Path(working_clone.working_dir)
+        integ_id = str(uuid4())
+        bifrost_dir = work_dir / ".bifrost"
+        bifrost_dir.mkdir(exist_ok=True)
+
+        # Pull 1: Two keys
+        (bifrost_dir / "integrations.yaml").write_text(yaml.dump({
+            "integrations": {
+                "SchemaTestInteg": {
+                    "id": integ_id,
+                    "config_schema": [
+                        {"key": "keep_me", "type": "string", "required": True, "position": 0},
+                        {"key": "remove_me", "type": "string", "required": False, "position": 1},
+                    ],
+                },
+            },
+        }, default_flow_style=False))
+        working_clone.index.add([".bifrost/integrations.yaml"])
+        working_clone.index.commit("initial schema")
+        working_clone.remotes.origin.push()
+        result = await sync_service.desktop_pull()
+        assert result.success is True
+
+        # Add a Config value for "keep_me"
+        cs_result = await db_session.execute(
+            select(IntegrationConfigSchema).where(
+                IntegrationConfigSchema.integration_id == UUIDType(integ_id),
+                IntegrationConfigSchema.key == "keep_me",
+            )
+        )
+        keep_schema = cs_result.scalar_one()
+        config_val = Config(
+            integration_id=UUIDType(integ_id),
+            organization_id=None,
+            key="keep_me",
+            value={"value": "preserved"},
+            config_type="string",
+            config_schema_id=keep_schema.id,
+            updated_by="test",
+        )
+        db_session.add(config_val)
+        await db_session.commit()
+
+        # Pull 2: Remove "remove_me", add "new_key"
+        (bifrost_dir / "integrations.yaml").write_text(yaml.dump({
+            "integrations": {
+                "SchemaTestInteg": {
+                    "id": integ_id,
+                    "config_schema": [
+                        {"key": "keep_me", "type": "string", "required": True, "position": 0},
+                        {"key": "new_key", "type": "int", "required": False, "position": 1},
+                    ],
+                },
+            },
+        }, default_flow_style=False))
+        working_clone.index.add([".bifrost/integrations.yaml"])
+        working_clone.index.commit("update schema")
+        working_clone.remotes.origin.push()
+        result2 = await sync_service.desktop_pull()
+        assert result2.success is True
+
+        # Verify: keep_me config value survived, remove_me schema gone, new_key added
+        cs_result2 = await db_session.execute(
+            select(IntegrationConfigSchema).where(
+                IntegrationConfigSchema.integration_id == UUIDType(integ_id)
+            ).order_by(IntegrationConfigSchema.position)
+        )
+        schemas = cs_result2.scalars().all()
+        schema_keys = [s.key for s in schemas]
+        assert "keep_me" in schema_keys
+        assert "new_key" in schema_keys
+        assert "remove_me" not in schema_keys
+
+        cfg_result = await db_session.execute(
+            select(Config).where(
+                Config.integration_id == UUIDType(integ_id),
+                Config.key == "keep_me",
+            )
+        )
+        cfg = cfg_result.scalar_one_or_none()
+        assert cfg is not None, "keep_me Config value was destroyed"
+        assert cfg.value == {"value": "preserved"}
+
 
 # =============================================================================
 # Cross-Instance Manifest Reconciliation
@@ -2327,10 +2597,10 @@ class TestCrossInstanceManifestReconciliation:
         persistent_dir = sync_service._persistent_dir
         final_manifest = read_manifest_from_dir(persistent_dir / ".bifrost")
 
-        config_keys = set(final_manifest.configs.keys())
-        assert "keep_this" in config_keys, f"config-1 should be preserved, got: {config_keys}"
-        assert "new_from_dev" in config_keys, f"dev's new config should be merged in, got: {config_keys}"
-        assert "delete_this" not in config_keys, f"config-2 should be deleted, got: {config_keys}"
+        config_key_names = {c.key for c in final_manifest.configs.values()}
+        assert "keep_this" in config_key_names, f"config-1 should be preserved, got: {config_key_names}"
+        assert "new_from_dev" in config_key_names, f"dev's new config should be merged in, got: {config_key_names}"
+        assert "delete_this" not in config_key_names, f"config-2 should be deleted, got: {config_key_names}"
 
     async def test_empty_repo_pull_imports_remote_state(
         self,
@@ -2556,13 +2826,10 @@ class TestPullUpsertNaturalKeys:
         id_b = uuid4()
         clone_dir = Path(working_clone.working_dir)
 
-        # Write app.yaml file
+        # Write app layout file
         app_dir = clone_dir / "apps" / "natural-key-app"
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.yaml").write_text(yaml.dump({
-            "name": "Natural Key App Updated",
-            "description": "Updated from remote",
-        }, default_flow_style=False))
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         bifrost_dir = clone_dir / ".bifrost"
         bifrost_dir.mkdir(exist_ok=True)
@@ -2570,15 +2837,17 @@ class TestPullUpsertNaturalKeys:
             "apps": {
                 "natural-key-app": {
                     "id": str(id_b),
-                    "path": "apps/natural-key-app/app.yaml",
+                    "path": "apps/natural-key-app",
                     "slug": "natural-key-app",
+                    "name": "Natural Key App Updated",
+                    "description": "Updated from remote",
                 }
             }
         }, default_flow_style=False, sort_keys=False)
         (bifrost_dir / "metadata.yaml").write_text(manifest_content)
 
         working_clone.index.add([
-            "apps/natural-key-app/app.yaml",
+            "apps/natural-key-app/_layout.tsx",
             ".bifrost/metadata.yaml",
         ])
         working_clone.index.commit("Add app with different ID")
@@ -2786,10 +3055,7 @@ class TestPullUpsertNaturalKeys:
         custom_path = "custom/team/dashboard"
         app_dir = clone_dir / custom_path
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.yaml").write_text(yaml.dump({
-            "name": "Team Dashboard",
-            "description": "Custom path app",
-        }, default_flow_style=False))
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         bifrost_dir = clone_dir / ".bifrost"
         bifrost_dir.mkdir(exist_ok=True)
@@ -2797,15 +3063,17 @@ class TestPullUpsertNaturalKeys:
             "apps": {
                 "team-dashboard": {
                     "id": str(app_id),
-                    "path": f"{custom_path}/app.yaml",
+                    "path": custom_path,
                     "slug": "team-dashboard",
+                    "name": "Team Dashboard",
+                    "description": "Custom path app",
                 }
             }
         }, default_flow_style=False, sort_keys=False)
         (bifrost_dir / "metadata.yaml").write_text(manifest_content)
 
         working_clone.index.add([
-            f"{custom_path}/app.yaml",
+            f"{custom_path}/_layout.tsx",
             ".bifrost/metadata.yaml",
         ])
         working_clone.index.commit("Add app at custom path")
@@ -2839,10 +3107,7 @@ class TestPullUpsertNaturalKeys:
         slug = "my_app"
         app_dir = clone_dir / "apps" / slug
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.yaml").write_text(yaml.dump({
-            "name": "My Underscore App",
-            "description": "Has underscores in slug",
-        }, default_flow_style=False))
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         bifrost_dir = clone_dir / ".bifrost"
         bifrost_dir.mkdir(exist_ok=True)
@@ -2850,15 +3115,17 @@ class TestPullUpsertNaturalKeys:
             "apps": {
                 slug: {
                     "id": str(app_id),
-                    "path": f"apps/{slug}/app.yaml",
+                    "path": f"apps/{slug}",
                     "slug": slug,
+                    "name": "My Underscore App",
+                    "description": "Has underscores in slug",
                 }
             }
         }, default_flow_style=False, sort_keys=False)
         (bifrost_dir / "metadata.yaml").write_text(manifest_content)
 
         working_clone.index.add([
-            f"apps/{slug}/app.yaml",
+            f"apps/{slug}/_layout.tsx",
             ".bifrost/metadata.yaml",
         ])
         working_clone.index.commit("Add app with underscore slug")
@@ -3487,10 +3754,10 @@ class TestImportOrder:
         bifrost_dir = work_dir / ".bifrost"
         bifrost_dir.mkdir(exist_ok=True)
 
-        # Write app YAML
-        app_path = work_dir / "apps" / "testapp" / "app.yaml"
-        app_path.parent.mkdir(parents=True, exist_ok=True)
-        app_path.write_text(yaml.dump({"name": "TestApp"}, default_flow_style=False))
+        # Write app layout file
+        app_dir = work_dir / "apps" / "testapp"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         (bifrost_dir / "organizations.yaml").write_text(yaml.dump({
             "organizations": [{"id": str(org_id), "name": "TableOrg"}]
@@ -3499,8 +3766,9 @@ class TestImportOrder:
             "apps": {
                 "testapp": {
                     "id": app_id,
-                    "path": "apps/testapp/app.yaml",
+                    "path": "apps/testapp",
                     "slug": "testapp",
+                    "name": "TestApp",
                     "organization_id": str(org_id),
                 }
             }
@@ -3516,7 +3784,7 @@ class TestImportOrder:
         }, default_flow_style=False))
 
         working_clone.index.add([
-            "apps/testapp/app.yaml",
+            "apps/testapp/_layout.tsx",
             ".bifrost/organizations.yaml",
             ".bifrost/apps.yaml",
             ".bifrost/tables.yaml",
@@ -3742,10 +4010,10 @@ class TestImportOrder:
             "name": "FullTestAgent", "system_prompt": "test", "tool_ids": [wf_id],
         }, default_flow_style=False))
 
-        # Write app YAML
+        # Write app layout file
         app_dir = work_dir / "apps" / "fullapp"
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.yaml").write_text(yaml.dump({"name": "FullTestApp"}, default_flow_style=False))
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         # Write all manifest files
         (bifrost_dir / "organizations.yaml").write_text(yaml.dump({
@@ -3791,8 +4059,9 @@ class TestImportOrder:
             "apps": {
                 "fullapp": {
                     "id": app_id,
-                    "path": "apps/fullapp/app.yaml",
+                    "path": "apps/fullapp",
                     "slug": "fullapp",
+                    "name": "FullTestApp",
                     "organization_id": org_id,
                     "roles": [role_id],
                 }
@@ -3848,7 +4117,7 @@ class TestImportOrder:
             "workflows/full_test.py",
             f"forms/{form_id}.form.yaml",
             f"agents/{agent_id}.agent.yaml",
-            "apps/fullapp/app.yaml",
+            "apps/fullapp/_layout.tsx",
             ".bifrost/organizations.yaml",
             ".bifrost/roles.yaml",
             ".bifrost/workflows.yaml",
@@ -3983,21 +4252,22 @@ class TestAccessLevelSync:
 
         app_dir = work_dir / "apps" / "accessapp"
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.yaml").write_text(yaml.dump({"name": "AccessApp"}, default_flow_style=False))
+        (app_dir / "_layout.tsx").write_text("export default function Layout({ children }) { return <>{children}</>; }\n")
 
         (bifrost_dir / "apps.yaml").write_text(yaml.dump({
             "apps": {
                 "accessapp": {
                     "id": app_id,
-                    "path": "apps/accessapp/app.yaml",
+                    "path": "apps/accessapp",
                     "slug": "accessapp",
+                    "name": "AccessApp",
                     "access_level": "public",
                 }
             }
         }, default_flow_style=False))
 
         working_clone.index.add([
-            "apps/accessapp/app.yaml",
+            "apps/accessapp/_layout.tsx",
             ".bifrost/apps.yaml",
         ])
         working_clone.index.commit("App access level")

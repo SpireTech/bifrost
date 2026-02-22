@@ -416,6 +416,7 @@ def full_manifest_data():
     config_id = str(uuid4())
     secret_config_id = str(uuid4())
     table_id = str(uuid4())
+    oauth_token_id = str(uuid4())
     event_source_id = str(uuid4())
     event_sub_id = str(uuid4())
 
@@ -430,6 +431,7 @@ def full_manifest_data():
         "integ_id": integ_id,
         "config_id": config_id,
         "secret_config_id": secret_config_id,
+        "oauth_token_id": oauth_token_id,
         "table_id": table_id,
         "event_source_id": event_source_id,
         "event_sub_id": event_sub_id,
@@ -486,12 +488,13 @@ def full_manifest_data():
                             "organization_id": org_id,
                             "entity_id": "tenant-123",
                             "entity_name": "My Tenant",
+                            "oauth_token_id": oauth_token_id,
                         },
                     ],
                 },
             },
             "configs": {
-                "halopsa/api_url": {
+                config_id: {
                     "id": config_id,
                     "integration_id": integ_id,
                     "key": "halopsa/api_url",
@@ -500,7 +503,7 @@ def full_manifest_data():
                     "organization_id": org_id,
                     "value": "https://api.halopsa.com",
                 },
-                "halopsa/api_key": {
+                secret_config_id: {
                     "id": secret_config_id,
                     "integration_id": integ_id,
                     "key": "halopsa/api_key",
@@ -563,7 +566,10 @@ def full_manifest_data():
             "apps": {
                 "my_app": {
                     "id": app_id,
-                    "path": "apps/my-app/app.yaml",
+                    "path": "apps/my-app",
+                    "name": "My App",
+                    "description": "Test app",
+                    "dependencies": {"recharts": "2.12"},
                     "organization_id": org_id,
                     "roles": [role_id],
                 },
@@ -609,6 +615,7 @@ class TestIntegrationManifest:
         assert len(integ.mappings) == 1
         assert integ.mappings[0].entity_id == "tenant-123"
         assert integ.mappings[0].organization_id == full_manifest_data["org_id"]
+        assert integ.mappings[0].oauth_token_id == full_manifest_data["oauth_token_id"]
 
     def test_integration_round_trip(self, full_manifest_data):
         """Integration survives serialize → parse round-trip."""
@@ -647,6 +654,31 @@ class TestIntegrationManifest:
         assert "mappings" not in integ
         assert "entity_id" not in integ
 
+    def test_mapping_oauth_token_id_round_trip(self):
+        """Mapping oauth_token_id survives serialize → parse round-trip."""
+        from src.services.manifest import (
+            Manifest, ManifestIntegration, ManifestIntegrationMapping,
+            serialize_manifest, parse_manifest,
+        )
+
+        token_id = str(uuid4())
+        manifest = Manifest(
+            integrations={
+                "TestInteg": ManifestIntegration(
+                    id=str(uuid4()),
+                    mappings=[
+                        ManifestIntegrationMapping(
+                            entity_id="tenant-1",
+                            oauth_token_id=token_id,
+                        ),
+                    ],
+                ),
+            },
+        )
+        output = serialize_manifest(manifest)
+        restored = parse_manifest(output)
+        assert restored.integrations["TestInteg"].mappings[0].oauth_token_id == token_id
+
     def test_integration_split_file(self, full_manifest_data):
         """Integrations serialize to integrations.yaml in split format."""
         from src.services.manifest import parse_manifest, serialize_manifest_dir, parse_manifest_dir
@@ -676,16 +708,19 @@ class TestConfigManifest:
         yaml_str = yaml.dump(full_manifest_data["manifest"], default_flow_style=False)
         manifest = parse_manifest(yaml_str)
 
-        assert "halopsa/api_url" in manifest.configs
-        cfg = manifest.configs["halopsa/api_url"]
-        assert cfg.id == full_manifest_data["config_id"]
+        config_id = full_manifest_data["config_id"]
+        secret_config_id = full_manifest_data["secret_config_id"]
+
+        assert config_id in manifest.configs
+        cfg = manifest.configs[config_id]
+        assert cfg.id == config_id
         assert cfg.config_type == "string"
         assert cfg.value == "https://api.halopsa.com"
         assert cfg.integration_id == full_manifest_data["integ_id"]
         assert cfg.organization_id == full_manifest_data["org_id"]
 
         # Secret config has null value
-        secret_cfg = manifest.configs["halopsa/api_key"]
+        secret_cfg = manifest.configs[secret_config_id]
         assert secret_cfg.config_type == "secret"
         assert secret_cfg.value is None
 
@@ -715,7 +750,7 @@ class TestConfigManifest:
         assert "configs.yaml" in files
         cfg_data = yaml.safe_load(files["configs.yaml"])
         assert "configs" in cfg_data
-        assert "halopsa/api_url" in cfg_data["configs"]
+        assert full_manifest_data["config_id"] in cfg_data["configs"]
 
 
 class TestTableManifest:
@@ -968,7 +1003,8 @@ class TestValidateManifestNewTypes:
         from src.services.manifest import parse_manifest, validate_manifest
 
         data = full_manifest_data["manifest"]
-        data["configs"]["halopsa/api_url"]["integration_id"] = str(uuid4())
+        config_id = full_manifest_data["config_id"]
+        data["configs"][config_id]["integration_id"] = str(uuid4())
         yaml_str = yaml.dump(data, default_flow_style=False)
         manifest = parse_manifest(yaml_str)
         errors = validate_manifest(manifest)
@@ -979,7 +1015,8 @@ class TestValidateManifestNewTypes:
         from src.services.manifest import parse_manifest, validate_manifest
 
         data = full_manifest_data["manifest"]
-        data["configs"]["halopsa/api_url"]["organization_id"] = str(uuid4())
+        config_id = full_manifest_data["config_id"]
+        data["configs"][config_id]["organization_id"] = str(uuid4())
         yaml_str = yaml.dump(data, default_flow_style=False)
         manifest = parse_manifest(yaml_str)
         errors = validate_manifest(manifest)
@@ -1041,6 +1078,49 @@ class TestValidateManifestNewTypes:
         assert any("workflow" in e.lower() for e in errors)
 
 
+class TestConfigDictKeyCollision:
+    """Verify configs with same key name but different scopes don't collide."""
+
+    def test_configs_with_same_key_different_orgs_survive_round_trip(self):
+        """Two configs with same key but different org_ids both survive serialization."""
+        from src.services.manifest import Manifest, ManifestConfig, serialize_manifest, parse_manifest
+
+        config_id_1 = str(uuid4())
+        config_id_2 = str(uuid4())
+        org_id_1 = str(uuid4())
+        org_id_2 = str(uuid4())
+        integ_id = str(uuid4())
+
+        manifest = Manifest(
+            configs={
+                config_id_1: ManifestConfig(
+                    id=config_id_1,
+                    integration_id=integ_id,
+                    key="api_url",
+                    config_type="string",
+                    organization_id=org_id_1,
+                    value="https://org1.example.com",
+                ),
+                config_id_2: ManifestConfig(
+                    id=config_id_2,
+                    integration_id=integ_id,
+                    key="api_url",
+                    config_type="string",
+                    organization_id=org_id_2,
+                    value="https://org2.example.com",
+                ),
+            },
+        )
+        output = serialize_manifest(manifest)
+        restored = parse_manifest(output)
+
+        assert len(restored.configs) == 2
+        assert config_id_1 in restored.configs
+        assert config_id_2 in restored.configs
+        assert restored.configs[config_id_1].value == "https://org1.example.com"
+        assert restored.configs[config_id_2].value == "https://org2.example.com"
+
+
 class TestGetAllEntityIdsNewTypes:
     """Test that get_all_entity_ids includes all new entity types."""
 
@@ -1065,3 +1145,78 @@ class TestGetAllEntityIdsNewTypes:
         assert full_manifest_data["table_id"] in ids
         assert full_manifest_data["event_source_id"] in ids
         assert full_manifest_data["event_sub_id"] in ids
+
+
+class TestManifestSchemaCoverage:
+    """Verify that all DB columns are either tracked in manifest models or explicitly ignored.
+
+    When a developer adds a new column to an integration ORM model, this test
+    forces them to decide: is this field managed by git (add to manifest model)
+    or managed exclusively by the UI/runtime (add to the ignored set)?
+    """
+
+    # Columns that are intentionally NOT in the manifest — either internal
+    # bookkeeping or UI-managed state.
+    INTEGRATION_IGNORED = {
+        "id",            # manifest uses dict key (name) for identity; id is a field inside
+        "name",          # used as the manifest dict key, not a model field
+        "is_deleted",    # soft-delete flag, internal
+        "created_at",
+        "updated_at",
+    }
+
+    CONFIG_SCHEMA_IGNORED = {
+        "id",              # DB surrogate key, not in manifest
+        "integration_id",  # implicit from parent integration
+        "created_at",
+        "updated_at",
+    }
+
+    MAPPING_IGNORED = {
+        "id",              # DB surrogate key
+        "integration_id",  # implicit from parent integration
+        "created_at",
+        "updated_at",
+    }
+
+    def test_integration_columns_tracked(self):
+        """All Integration DB columns are in ManifestIntegration or explicitly ignored."""
+        from sqlalchemy import inspect as sa_inspect
+        from src.models.orm.integrations import Integration
+        from src.services.manifest import ManifestIntegration
+
+        db_columns = {c.name for c in sa_inspect(Integration).columns}
+        manifest_fields = set(ManifestIntegration.model_fields.keys())
+        untracked = db_columns - manifest_fields - self.INTEGRATION_IGNORED
+        assert not untracked, (
+            f"New Integration DB columns not tracked in manifest or ignored: {untracked}. "
+            "Add them to ManifestIntegration or to INTEGRATION_IGNORED in this test."
+        )
+
+    def test_config_schema_columns_tracked(self):
+        """All IntegrationConfigSchema DB columns are in ManifestIntegrationConfigSchema or ignored."""
+        from sqlalchemy import inspect as sa_inspect
+        from src.models.orm.integrations import IntegrationConfigSchema
+        from src.services.manifest import ManifestIntegrationConfigSchema
+
+        db_columns = {c.name for c in sa_inspect(IntegrationConfigSchema).columns}
+        manifest_fields = set(ManifestIntegrationConfigSchema.model_fields.keys())
+        untracked = db_columns - manifest_fields - self.CONFIG_SCHEMA_IGNORED
+        assert not untracked, (
+            f"New IntegrationConfigSchema DB columns not tracked in manifest or ignored: {untracked}. "
+            "Add them to ManifestIntegrationConfigSchema or to CONFIG_SCHEMA_IGNORED in this test."
+        )
+
+    def test_mapping_columns_tracked(self):
+        """All IntegrationMapping DB columns are in ManifestIntegrationMapping or ignored."""
+        from sqlalchemy import inspect as sa_inspect
+        from src.models.orm.integrations import IntegrationMapping
+        from src.services.manifest import ManifestIntegrationMapping
+
+        db_columns = {c.name for c in sa_inspect(IntegrationMapping).columns}
+        manifest_fields = set(ManifestIntegrationMapping.model_fields.keys())
+        untracked = db_columns - manifest_fields - self.MAPPING_IGNORED
+        assert not untracked, (
+            f"New IntegrationMapping DB columns not tracked in manifest or ignored: {untracked}. "
+            "Add them to ManifestIntegrationMapping or to MAPPING_IGNORED in this test."
+        )

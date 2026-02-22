@@ -96,8 +96,11 @@ class ManifestAgent(BaseModel):
 class ManifestApp(BaseModel):
     """App entry in manifest."""
     id: str
-    path: str
+    path: str              # app source directory (e.g. "apps/my-app"), NOT app.yaml
     slug: str | None = None
+    name: str | None = None
+    description: str | None = None
+    dependencies: dict[str, str] = Field(default_factory=dict)
     organization_id: str | None = None
     roles: list[str] = Field(default_factory=list)
     access_level: str = "authenticated"
@@ -138,6 +141,7 @@ class ManifestIntegrationMapping(BaseModel):
     organization_id: str | None = None
     entity_id: str
     entity_name: str | None = None
+    oauth_token_id: str | None = None
 
 
 class ManifestIntegration(BaseModel):

@@ -273,6 +273,7 @@ async def generate_manifest(db: AsyncSession) -> Manifest:
                         organization_id=str(im.organization_id) if im.organization_id else None,
                         entity_id=im.entity_id,
                         entity_name=im.entity_name,
+                        oauth_token_id=str(im.oauth_token_id) if im.oauth_token_id else None,
                     )
                     for im in mappings_by_integ.get(str(integ.id), [])
                 ],
@@ -280,8 +281,8 @@ async def generate_manifest(db: AsyncSession) -> Manifest:
             for integ in integrations_list
         },
         configs={
-            # Key by "integration_name/key" or just "key" for non-integration configs
-            f"{cfg.key}": ManifestConfig(
+            # Key by config UUID to avoid cross-org collisions on same key name
+            str(cfg.id): ManifestConfig(
                 id=str(cfg.id),
                 integration_id=str(cfg.integration_id) if cfg.integration_id else None,
                 key=cfg.key,
@@ -332,8 +333,11 @@ async def generate_manifest(db: AsyncSession) -> Manifest:
         apps={
             app.name: ManifestApp(
                 id=str(app.id),
-                path=f"{(app.repo_path or f'apps/{app.slug}').rstrip('/')}/app.yaml",
+                path=(app.repo_path or f"apps/{app.slug}").rstrip("/"),
                 slug=app.slug,
+                name=app.name,
+                description=app.description,
+                dependencies=app.dependencies or {},
                 organization_id=str(app.organization_id) if app.organization_id else None,
                 roles=app_roles_by_app.get(str(app.id), []),
                 access_level=app.access_level if app.access_level else "authenticated",

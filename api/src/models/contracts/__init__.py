@@ -171,6 +171,7 @@ from src.models.contracts.config import (
     SecretUpdateRequest,
     SetConfigRequest,
     SetIntegrationConfigRequest,
+    UpdateConfigRequest,
 )
 
 # OAuth Connections
@@ -414,6 +415,9 @@ from src.models.contracts.integrations import (
     IntegrationListResponse,
     IntegrationMappingCreate,
     IntegrationMappingUpdate,
+    IntegrationMappingBatchItem,
+    IntegrationMappingBatchRequest,
+    IntegrationMappingBatchResponse,
     IntegrationMappingResponse,
     IntegrationMappingListResponse,
     OAuthConfigSummary,
@@ -621,6 +625,7 @@ __all__ = [
     "SystemLogsListResponse",
     # Config - use ConfigResponse or ConfigPublic for responses
     "SetConfigRequest",
+    "UpdateConfigRequest",
     "ConfigBase",
     "ConfigCreate",
     "ConfigUpdate",
@@ -825,6 +830,9 @@ __all__ = [
     "IntegrationListResponse",
     "IntegrationMappingCreate",
     "IntegrationMappingUpdate",
+    "IntegrationMappingBatchItem",
+    "IntegrationMappingBatchRequest",
+    "IntegrationMappingBatchResponse",
     "IntegrationMappingResponse",
     "IntegrationMappingListResponse",
     "IntegrationData",

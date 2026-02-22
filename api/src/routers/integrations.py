@@ -27,6 +27,8 @@ from src.models import (
     IntegrationDetailResponse,
     IntegrationListResponse,
     IntegrationMapping,
+    IntegrationMappingBatchRequest,
+    IntegrationMappingBatchResponse,
     IntegrationMappingCreate,
     IntegrationMappingListResponse,
     IntegrationMappingResponse,
@@ -379,16 +381,30 @@ class IntegrationsRepository:
         For each key-value pair:
         - If value is None or empty string, delete the entry (fall back to default)
         - Otherwise, upsert the entry
+        - Sets config_type based on integration config schema
+        - Encrypts secret values before storage
 
         Uses explicit SELECT + INSERT/UPDATE pattern because PostgreSQL's
         ON CONFLICT doesn't work with functional indexes (COALESCE for NULL handling).
         """
+        from src.core.security import encrypt_secret
+        from src.models.enums import ConfigType as ConfigTypeEnum
+
         # Look up schema items for this integration to get config_schema_id
         schema_result = await self.db.execute(
             select(IntegrationConfigSchema)
             .where(IntegrationConfigSchema.integration_id == integration_id)
         )
         schema_items = {item.key: item for item in schema_result.scalars().all()}
+
+        # Map schema type strings to ConfigTypeEnum
+        SCHEMA_TYPE_MAP = {
+            "string": ConfigTypeEnum.STRING,
+            "int": ConfigTypeEnum.INT,
+            "bool": ConfigTypeEnum.BOOL,
+            "json": ConfigTypeEnum.JSON,
+            "secret": ConfigTypeEnum.SECRET,
+        }
 
         for key, value in config.items():
             # Get the schema item for this key (for FK reference)
@@ -397,6 +413,11 @@ class IntegrationsRepository:
             # Validate value against schema type if schema exists
             if schema_item:
                 await self._validate_config_value(key, value, schema_item.type)
+
+            # Determine config_type from schema
+            db_config_type = ConfigTypeEnum.STRING
+            if schema_item:
+                db_config_type = SCHEMA_TYPE_MAP.get(schema_item.type, ConfigTypeEnum.STRING)
 
             # Build the WHERE clause for matching existing config
             # Handle NULL comparison properly with IS NULL
@@ -417,6 +438,11 @@ class IntegrationsRepository:
                 # Delete override (fall back to default)
                 await self.db.execute(delete(ConfigModel).where(where_clause))
             else:
+                # Encrypt secret values before storage
+                stored_value = value
+                if db_config_type == ConfigTypeEnum.SECRET and isinstance(value, str):
+                    stored_value = encrypt_secret(value)
+
                 # Check if record exists
                 result = await self.db.execute(
                     select(ConfigModel.id).where(where_clause)
@@ -430,7 +456,8 @@ class IntegrationsRepository:
                         update(ConfigModel)
                         .where(ConfigModel.id == existing)
                         .values(
-                            value={"value": value},
+                            value={"value": stored_value},
+                            config_type=db_config_type,
                             updated_by=updated_by,
                             config_schema_id=schema_item.id if schema_item else None,
                         )
@@ -441,7 +468,8 @@ class IntegrationsRepository:
                         integration_id=integration_id,
                         organization_id=organization_id,
                         key=key,
-                        value={"value": value},
+                        value={"value": stored_value},
+                        config_type=db_config_type,
                         updated_by=updated_by,
                         config_schema_id=schema_item.id if schema_item else None,
                     )
@@ -495,6 +523,25 @@ class IntegrationsRepository:
         await self.db.flush()
         return True
 
+    async def _extract_config_value(self, entry: ConfigModel) -> Any:
+        """Extract config value, decrypting secrets."""
+        from src.core.security import decrypt_secret
+        from src.models.enums import ConfigType as ConfigTypeEnum
+
+        value = entry.value
+        if isinstance(value, dict) and "value" in value:
+            raw = value["value"]
+        else:
+            raw = value
+
+        if entry.config_type == ConfigTypeEnum.SECRET and isinstance(raw, str):
+            try:
+                return decrypt_secret(raw)
+            except Exception:
+                # Value may not be encrypted yet (pre-migration data)
+                return raw
+        return raw
+
     async def get_integration_defaults(self, integration_id: UUID) -> dict[str, Any]:
         """
         Get integration-level default config values.
@@ -513,11 +560,7 @@ class IntegrationsRepository:
 
         config: dict[str, Any] = {}
         for entry in config_entries:
-            value = entry.value
-            if isinstance(value, dict) and "value" in value:
-                config[entry.key] = value["value"]
-            else:
-                config[entry.key] = value
+            config[entry.key] = await self._extract_config_value(entry)
 
         return config
 
@@ -542,11 +585,7 @@ class IntegrationsRepository:
 
         config: dict[str, Any] = {}
         for entry in config_entries:
-            value = entry.value
-            if isinstance(value, dict) and "value" in value:
-                config[entry.key] = value["value"]
-            else:
-                config[entry.key] = value
+            config[entry.key] = await self._extract_config_value(entry)
 
         return config
 
@@ -571,11 +610,7 @@ class IntegrationsRepository:
             org_id = entry.organization_id
             if org_id not in configs_by_org:
                 configs_by_org[org_id] = {}
-            value = entry.value
-            if isinstance(value, dict) and "value" in value:
-                configs_by_org[org_id][entry.key] = value["value"]
-            else:
-                configs_by_org[org_id][entry.key] = value
+            configs_by_org[org_id][entry.key] = await self._extract_config_value(entry)
 
         return configs_by_org
 
@@ -1135,6 +1170,71 @@ async def update_mapping(
         config=org_config if org_config else None,
         created_at=mapping.created_at,
         updated_at=mapping.updated_at,
+    )
+
+
+@router.post(
+    "/{integration_id}/mappings/batch",
+    response_model=IntegrationMappingBatchResponse,
+    summary="Batch upsert integration mappings",
+    description="Create or update multiple mappings in a single request (Platform admin only)",
+)
+async def batch_upsert_mappings(
+    integration_id: UUID,
+    request: IntegrationMappingBatchRequest,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> IntegrationMappingBatchResponse:
+    """Batch create/update integration mappings."""
+    repo = IntegrationsRepository(ctx.db)
+
+    # Verify integration exists
+    integration = await repo.get_integration_by_id(integration_id)
+    if not integration:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found",
+        )
+
+    created = 0
+    updated = 0
+    errors: list[str] = []
+
+    for item in request.mappings:
+        try:
+            existing = await repo.get_mapping_by_org(integration_id, item.organization_id)
+            if existing:
+                update_data = IntegrationMappingUpdate(
+                    entity_id=item.entity_id,
+                    entity_name=item.entity_name,
+                )
+                await repo.update_mapping(
+                    integration_id, existing.id, update_data, updated_by=user.email
+                )
+                updated += 1
+            else:
+                create_data = IntegrationMappingCreate(
+                    organization_id=item.organization_id,
+                    entity_id=item.entity_id,
+                    entity_name=item.entity_name,
+                )
+                await repo.create_mapping(create_data, integration_id, updated_by=user.email)
+                created += 1
+        except Exception as e:
+            errors.append(f"org {item.organization_id}: {str(e)}")
+            logger.error(f"Batch mapping error for org {item.organization_id}: {e}")
+
+    await ctx.db.commit()
+
+    logger.info(
+        f"Batch upsert for integration {integration_id}: "
+        f"created={created}, updated={updated}, errors={len(errors)}"
+    )
+
+    return IntegrationMappingBatchResponse(
+        created=created,
+        updated=updated,
+        errors=errors,
     )
 
 

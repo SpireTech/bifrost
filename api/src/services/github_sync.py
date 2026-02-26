@@ -14,6 +14,7 @@ Key principles:
 import hashlib
 import logging
 import subprocess
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,6 +35,7 @@ from src.services.github_sync_entity_metadata import extract_entity_metadata
 
 if TYPE_CHECKING:
     from src.models.contracts.github import (
+        AbortMergeResult,
         CommitResult,
         DiscardResult,
         DiffResult,
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
         PullResult,
         PushResult,
         ResolveResult,
+        SyncResult,
         WorkingTreeStatus,
     )
     from src.services.sync_ops import SyncOp
@@ -86,6 +89,316 @@ def _walk_tree(root: Path) -> dict[str, bytes]:
             continue
         files[rel] = p.read_bytes()
     return files
+
+
+def _auto_resolve_manifest_conflicts(repo: GitRepo, work_dir: Path, unmerged: dict) -> set[str]:
+    """Auto-resolve .bifrost/*.yaml manifest conflicts via YAML union merge.
+
+    For each conflicted manifest file:
+    1. Parse ours (stage 2) and theirs (stage 3) YAML
+    2. Union merge at top-level dict key level (theirs wins on value conflicts)
+    3. Write merged YAML to working tree and git add
+    4. On failure, accept theirs entirely
+
+    Returns set of paths that were auto-resolved (removed from conflict list).
+    """
+    resolved_paths: set[str] = set()
+
+    for cpath in list(unmerged.keys()):
+        cpath_str = str(cpath)
+        if not (cpath_str.startswith(".bifrost/") and cpath_str.endswith(".yaml")):
+            continue
+
+        try:
+            # Parse both sides
+            ours_yaml = None
+            theirs_yaml = None
+            try:
+                ours_raw = repo.git.show(f":2:{cpath_str}")
+                ours_yaml = yaml.safe_load(ours_raw) or {}
+            except Exception:
+                ours_yaml = {}
+            try:
+                theirs_raw = repo.git.show(f":3:{cpath_str}")
+                theirs_yaml = yaml.safe_load(theirs_raw) or {}
+            except Exception:
+                theirs_yaml = {}
+
+            if not isinstance(ours_yaml, dict) or not isinstance(theirs_yaml, dict):
+                # Not a dict-shaped YAML — fall back to accepting theirs
+                raise ValueError("Non-dict YAML")
+
+            # Union merge: for each top-level key, merge the sub-dicts/lists
+            merged = {}
+            all_keys = set(ours_yaml.keys()) | set(theirs_yaml.keys())
+            for key in all_keys:
+                ours_val = ours_yaml.get(key)
+                theirs_val = theirs_yaml.get(key)
+
+                if key not in ours_yaml:
+                    merged[key] = theirs_val
+                elif key not in theirs_yaml:
+                    merged[key] = ours_val
+                elif isinstance(ours_val, dict) and isinstance(theirs_val, dict):
+                    # Merge dict entries (keyed by sub-key); theirs wins on conflicts
+                    merged_dict = dict(ours_val)
+                    merged_dict.update(theirs_val)
+                    merged[key] = merged_dict
+                elif isinstance(ours_val, list) and isinstance(theirs_val, list):
+                    # For lists, use theirs (lists aren't keyed, can't union safely)
+                    merged[key] = theirs_val
+                else:
+                    # Scalar or mismatched types — theirs wins
+                    merged[key] = theirs_val
+
+            # Write merged YAML
+            merged_yaml = yaml.dump(merged, default_flow_style=False, sort_keys=True, allow_unicode=True)
+            file_path = work_dir / cpath_str
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(merged_yaml)
+            repo.git.add(cpath_str)
+            resolved_paths.add(cpath_str)
+            logger.info(f"Auto-resolved manifest conflict: {cpath_str}")
+
+        except Exception as e:
+            # Fall back to accepting theirs entirely
+            logger.warning(f"Manifest auto-merge failed for {cpath_str}, accepting theirs: {e}")
+            try:
+                theirs_raw = repo.git.show(f":3:{cpath_str}")
+                file_path = work_dir / cpath_str
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(theirs_raw)
+                repo.git.add(cpath_str)
+                resolved_paths.add(cpath_str)
+            except Exception as fallback_err:
+                logger.error(f"Failed to accept theirs for {cpath_str}: {fallback_err}")
+
+    return resolved_paths
+
+
+def _classify_conflict_type(unmerged: dict, cpath: str) -> str:
+    """Classify conflict type from git unmerged blob stages.
+
+    Stage 1 = common ancestor, Stage 2 = ours, Stage 3 = theirs.
+    """
+    # unmerged keys may be PathLike — find matching entry by str comparison
+    entries = None
+    for key, val in unmerged.items():
+        if str(key) == cpath:
+            entries = val
+            break
+    if not entries:
+        return "both_modified"
+    stages = {stage for stage, _blob in entries}
+    if stages >= {1, 2, 3}:
+        return "both_modified"
+    elif stages == {2, 3}:
+        return "both_added"
+    elif stages == {1, 3}:
+        return "deleted_by_us"
+    elif stages == {1, 2}:
+        return "deleted_by_them"
+    else:
+        return "both_modified"
+
+
+# =============================================================================
+# Standalone manifest import (no git, reads from S3)
+# =============================================================================
+
+@dataclass
+class ManifestImportResult:
+    """Result of importing manifest from repo."""
+    applied: bool = False
+    warnings: list[str] = field(default_factory=list)
+    manifest_files: dict[str, str] = field(default_factory=dict)
+    modified_files: dict[str, str] = field(default_factory=dict)
+
+
+async def import_manifest_from_repo(db: AsyncSession) -> ManifestImportResult:
+    """Import manifest from S3 _repo/.bifrost/ into DB.
+
+    Standalone function (not a method on GitHubSyncService) that:
+    1. Reads .bifrost/*.yaml from S3 via RepoStorage
+    2. Parses with parse_manifest_dir()
+    3. Validates with validate_manifest()
+    4. Resolves entities to DB using GitHubSyncService.plan_import
+    5. Runs indexer side-effects for forms/agents
+    6. Regenerates manifest from DB
+    7. Returns ManifestImportResult
+    """
+    from src.services.repo_storage import RepoStorage
+    from src.services.manifest import (
+        MANIFEST_FILES,
+        parse_manifest_dir,
+        serialize_manifest_dir,
+        validate_manifest,
+    )
+    from src.services.manifest_generator import generate_manifest
+
+    result = ManifestImportResult()
+    repo = RepoStorage()
+
+    # 1. Read .bifrost/*.yaml from S3
+    manifest_yaml_files: dict[str, str] = {}
+    for _entity_type, filename in MANIFEST_FILES.items():
+        s3_path = f".bifrost/{filename}"
+        try:
+            content = await repo.read(s3_path)
+            manifest_yaml_files[filename] = content.decode("utf-8")
+        except Exception:
+            pass  # File doesn't exist in S3, skip
+
+    if not manifest_yaml_files:
+        result.warnings.append("No .bifrost/ manifest files found in repo")
+        return result
+
+    # 2. Parse
+    try:
+        manifest = parse_manifest_dir(manifest_yaml_files)
+    except Exception as e:
+        result.warnings.append(f"Failed to parse manifest: {e}")
+        return result
+
+    # 3. Validate
+    validation_errors = validate_manifest(manifest)
+    if validation_errors:
+        result.warnings.extend(validation_errors)
+        return result
+
+    # 4. Create a temporary directory structure for plan_import
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        work_dir = Path(tmp_dir)
+
+        # Write manifest files to temp .bifrost/
+        bifrost_dir = work_dir / ".bifrost"
+        bifrost_dir.mkdir()
+        for filename, file_content in manifest_yaml_files.items():
+            (bifrost_dir / filename).write_text(file_content)
+
+        # Download workflow/form/agent source files from S3 to temp dir
+        for _wf_name, mwf in manifest.workflows.items():
+            local_path = work_dir / mwf.path
+            try:
+                content_bytes = await repo.read(mwf.path)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(content_bytes)
+            except Exception:
+                pass
+
+        for _form_name, mform in manifest.forms.items():
+            local_path = work_dir / mform.path
+            try:
+                content_bytes = await repo.read(mform.path)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(content_bytes)
+            except Exception:
+                pass
+
+        for _agent_name, magent in manifest.agents.items():
+            local_path = work_dir / magent.path
+            try:
+                content_bytes = await repo.read(magent.path)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(content_bytes)
+            except Exception:
+                pass
+
+        # 5. Run entity resolution via GitHubSyncService
+        service = GitHubSyncService(db, repo_url="", branch="main")
+
+        try:
+            async with db.begin_nested():
+                await service.plan_import(manifest, work_dir)
+
+                # Run indexer side-effects (same as _import_all_entities)
+                from src.services.file_storage.indexers.form import FormIndexer
+                form_indexer = FormIndexer(db)
+                for _form_name, mform in manifest.forms.items():
+                    form_path = work_dir / mform.path
+                    if form_path.exists():
+                        content_bytes = form_path.read_bytes()
+                        original_data = yaml.safe_load(content_bytes.decode("utf-8"))
+                        if original_data:
+                            data = dict(original_data)
+                            data["id"] = mform.id
+                            await service._resolve_ref_field(data, "workflow_id")
+                            await service._resolve_ref_field(data, "launch_workflow_id")
+                            updated_content = (yaml.dump(data, default_flow_style=False, sort_keys=False).rstrip() + "\n").encode("utf-8")
+                            await form_indexer.index_form(f"forms/{mform.id}.form.yaml", updated_content)
+
+                            # Only mark as modified if data actually changed (not just formatting)
+                            if data != original_data:
+                                result.modified_files[mform.path] = updated_content.decode("utf-8")
+
+                            # Post-indexer: update org_id and access_level
+                            from sqlalchemy import update as sa_update
+                            from src.models.orm.forms import Form
+                            org_id_uuid = UUID(mform.organization_id) if mform.organization_id else None
+                            form_id_uuid = UUID(mform.id)
+                            post_values: dict = {}
+                            if org_id_uuid:
+                                post_values["organization_id"] = org_id_uuid
+                            if mform.access_level:
+                                post_values["access_level"] = mform.access_level
+                            if post_values:
+                                post_values["updated_at"] = datetime.now(timezone.utc)
+                                await db.execute(
+                                    sa_update(Form).where(Form.id == form_id_uuid).values(**post_values)
+                                )
+
+                from src.services.file_storage.indexers.agent import AgentIndexer
+                agent_indexer = AgentIndexer(db)
+                for _agent_name, magent in manifest.agents.items():
+                    agent_path = work_dir / magent.path
+                    if agent_path.exists():
+                        content_bytes = agent_path.read_bytes()
+                        original_data = yaml.safe_load(content_bytes.decode("utf-8"))
+                        if original_data:
+                            data = dict(original_data)
+                            data["id"] = magent.id
+                            await service._resolve_ref_field(data, "tool_ids")
+                            if "tools" in data and "tool_ids" not in data:
+                                await service._resolve_ref_field(data, "tools")
+                            updated_content = (yaml.dump(data, default_flow_style=False, sort_keys=False).rstrip() + "\n").encode("utf-8")
+                            await agent_indexer.index_agent(f"agents/{magent.id}.agent.yaml", updated_content)
+
+                            # Only mark as modified if data actually changed (not just formatting)
+                            if data != original_data:
+                                result.modified_files[magent.path] = updated_content.decode("utf-8")
+
+                            # Post-indexer: update org_id and access_level
+                            from sqlalchemy import update as sa_update
+                            from src.models.orm.agents import Agent
+                            org_id_uuid = UUID(magent.organization_id) if magent.organization_id else None
+                            agent_id_uuid = UUID(magent.id)
+                            post_values_a: dict = {}
+                            if org_id_uuid:
+                                post_values_a["organization_id"] = org_id_uuid
+                            if magent.access_level:
+                                post_values_a["access_level"] = magent.access_level
+                            if post_values_a:
+                                post_values_a["updated_at"] = datetime.now(timezone.utc)
+                                await db.execute(
+                                    sa_update(Agent).where(Agent.id == agent_id_uuid).values(**post_values_a)
+                                )
+
+                result.applied = True
+
+        except Exception as e:
+            result.warnings.append(f"Entity resolution failed: {e}")
+            logger.warning(f"Manifest import entity resolution failed: {e}", exc_info=True)
+
+    # 6. Regenerate manifest from DB
+    try:
+        new_manifest = await generate_manifest(db)
+        result.manifest_files = serialize_manifest_dir(new_manifest)
+    except Exception as e:
+        result.warnings.append(f"Manifest regeneration failed: {e}")
+
+    return result
 
 
 # =============================================================================
@@ -181,7 +494,18 @@ class GitHubSyncService:
         conflict_list: list[MergeConflict] = []
         try:
             unmerged = repo.index.unmerged_blobs()
-            for cpath in sorted(unmerged.keys()):
+        except Exception:
+            unmerged = {}
+
+        if unmerged:
+            # Auto-resolve .bifrost/*.yaml manifest conflicts
+            try:
+                _auto_resolve_manifest_conflicts(repo, work_dir, unmerged)
+                unmerged = repo.index.unmerged_blobs()
+            except Exception as e:
+                logger.warning(f"Manifest auto-resolve in status failed: {e}")
+
+            for cpath in sorted(str(k) for k in unmerged.keys()):
                 ours_content = None
                 theirs_content = None
                 try:
@@ -192,16 +516,15 @@ class GitHubSyncService:
                     theirs_content = repo.git.show(f":3:{cpath}")
                 except Exception:
                     pass
-                metadata = extract_entity_metadata(str(cpath))
+                metadata = extract_entity_metadata(cpath)
                 conflict_list.append(MergeConflict(
-                    path=str(cpath),
+                    path=cpath,
                     ours_content=ours_content,
                     theirs_content=theirs_content,
                     display_name=metadata.display_name,
                     entity_type=metadata.entity_type,
+                    conflict_type=_classify_conflict_type(unmerged, cpath),
                 ))
-        except Exception:
-            pass  # No unmerged entries
 
         if conflict_list:
             return WorkingTreeStatus(
@@ -266,10 +589,8 @@ class GitHubSyncService:
         """Core commit logic. Stages, runs preflight, commits."""
         from src.models.contracts.github import CommitResult
 
-        # Regenerate manifest from DB before staging
+        # Regenerate manifest from DB so the commit captures current platform state
         await self._regenerate_manifest_to_dir(self.db, work_dir)
-
-        # Stage everything (now includes fresh manifest)
         repo.git.add(A=True)
 
         # Check if there are changes to commit
@@ -327,28 +648,29 @@ class GitHubSyncService:
         if not remote_exists:
             return PullResult(success=True, pulled=0)
 
-        # Stash local changes before merge (like GitHub Desktop)
-        stashed = False
-        try:
-            result = repo.git.stash("push", "--include-untracked", "-m", "bifrost-pull-stash")
-            stashed = "No local changes" not in result
-        except Exception as e:
-            logger.debug(f"Stash before pull: {e}")
-
-        # Attempt merge
         await _progress("Merging changes...")
         try:
-            repo.git.merge(f"origin/{self.branch}")
-        except Exception:
+            merge_output = repo.git.merge(f"origin/{self.branch}")
+            logger.info(f"Merge succeeded: {merge_output[:200] if merge_output else 'no output'}")
+        except Exception as merge_err:
+            logger.info(f"Merge failed: {merge_err}")
             is_merge_conflict = (work_dir / ".git" / "MERGE_HEAD").exists()
 
             if is_merge_conflict:
                 conflicts: list[MergeConflict] = []
                 try:
                     unmerged = repo.index.unmerged_blobs()
-                    conflicted_files = sorted(unmerged.keys())
                 except Exception:
-                    conflicted_files = []
+                    unmerged = {}
+
+                if unmerged:
+                    try:
+                        _auto_resolve_manifest_conflicts(repo, work_dir, unmerged)
+                        unmerged = repo.index.unmerged_blobs()
+                    except Exception as e:
+                        logger.warning(f"Manifest auto-resolve in pull failed: {e}")
+
+                conflicted_files = sorted(str(k) for k in unmerged.keys())
 
                 for cpath in conflicted_files:
                     ours_content = None
@@ -369,69 +691,20 @@ class GitHubSyncService:
                         theirs_content=theirs_content,
                         display_name=metadata.display_name,
                         entity_type=metadata.entity_type,
+                        conflict_type=_classify_conflict_type(unmerged, cpath),
                     ))
 
+                logger.info(f"Merge conflict: returning {len(conflicts)} conflicts to UI")
                 return PullResult(
                     success=False,
                     conflicts=conflicts,
                     error="Merge conflicts detected",
                 )
             else:
-                if stashed:
-                    try:
-                        repo.git.stash("pop")
-                    except Exception:
-                        logger.warning("Failed to pop stash after merge failure")
                 raise
 
-        # Import entities from the clean merged state BEFORE popping stash.
-        await _progress("Importing entities...")
-        async with self.db.begin_nested():
-            pulled = await self._import_all_entities(work_dir)
-            await self._delete_removed_entities(work_dir)
-            await self._update_file_index(work_dir)
-        await self.db.commit()
-
-        # Pop stash to restore local changes (after import reads clean state)
-        await _progress("Cleaning up...")
-        if stashed:
-            try:
-                repo.git.stash("pop")
-            except Exception as e:
-                logger.warning(f"Stash pop had conflicts: {e}")
-
-                stash_conflicts: list[MergeConflict] = []
-                try:
-                    unmerged = repo.index.unmerged_blobs()
-                    conflicted_files = sorted(unmerged.keys())
-                except Exception:
-                    conflicted_files = []
-
-                for cpath in conflicted_files:
-                    ours_content = None
-                    theirs_content = None
-                    try:
-                        ours_content = repo.git.show(f":2:{cpath}")
-                    except Exception:
-                        pass
-                    try:
-                        theirs_content = repo.git.show(f":3:{cpath}")
-                    except Exception:
-                        pass
-                    metadata = extract_entity_metadata(cpath)
-                    stash_conflicts.append(MergeConflict(
-                        path=cpath,
-                        ours_content=ours_content,
-                        theirs_content=theirs_content,
-                        display_name=metadata.display_name,
-                        entity_type=metadata.entity_type,
-                    ))
-
-                return PullResult(
-                    success=False,
-                    conflicts=stash_conflicts,
-                    error="Local changes conflict with pulled changes",
-                )
+        # Entity import is handled by desktop_sync() after push succeeds.
+        pulled = 0  # Will be counted during entity import in desktop_sync
 
         # Sync app preview files from repo to _apps/{id}/preview/
         await self._sync_app_previews(work_dir)
@@ -489,30 +762,39 @@ class GitHubSyncService:
         )
 
     # -----------------------------------------------------------------
-    # Desktop-style operations: fetch, status, commit, pull, push, resolve, diff
+    # Desktop-style operations: fetch, status, commit, sync, resolve, diff
     # -----------------------------------------------------------------
 
-    async def desktop_fetch(self) -> "FetchResult":
-        """Git fetch origin. Compute ahead/behind counts."""
+    async def desktop_fetch(self, job_id: str | None = None) -> "FetchResult":
+        """Git fetch origin. S3 sync down → regenerate manifest → git fetch → ahead/behind."""
         from src.models.contracts.github import FetchResult
 
+        async def _progress(phase: str) -> None:
+            if job_id:
+                from src.core.pubsub import publish_git_progress
+                await publish_git_progress(job_id, phase)
+
         try:
+            await _progress("Syncing from storage...")
             async with self.repo_manager.checkout() as work_dir:
                 repo = self._open_or_init(work_dir)
+                await _progress("Generating manifest...")
                 await self._regenerate_manifest_to_dir(self.db, work_dir)
+                await _progress("Fetching remote...")
                 return self._do_fetch(work_dir, repo)
         except Exception as e:
             logger.error(f"Fetch failed: {e}", exc_info=True)
             return FetchResult(success=False, error=str(e))
 
     async def desktop_status(self) -> "WorkingTreeStatus":
-        """Get working tree status (uncommitted changes)."""
+        """Get working tree status. No lock, no S3. Returns empty if not initialized."""
         from src.models.contracts.github import WorkingTreeStatus
 
         try:
-            async with self.repo_manager.checkout_readonly() as work_dir:
+            if not self.repo_manager.is_initialized:
+                return WorkingTreeStatus()
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
-                await self._regenerate_manifest_to_dir(self.db, work_dir)
                 return self._do_status(work_dir, repo)
         except Exception as e:
             logger.error(f"Status failed: {e}", exc_info=True)
@@ -594,119 +876,115 @@ class GitHubSyncService:
 
     async def desktop_commit(self, message: str) -> "CommitResult":
         """
-        Commit working tree changes (local only, no push).
+        Commit working tree changes (local only, no push, no S3 sync).
         Runs preflight, commits if valid.
         """
         from src.models.contracts.github import CommitResult
 
         try:
-            async with self.repo_manager.checkout() as work_dir:
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
                 return await self._do_commit(work_dir, repo, message)
         except Exception as e:
             logger.error(f"Commit failed: {e}", exc_info=True)
             return CommitResult(success=False, error=str(e))
 
-    async def desktop_pull(self, job_id: str | None = None) -> "PullResult":
+    async def desktop_sync(self, job_id: str | None = None) -> "SyncResult":
+        """Combined pull + push. The ONLY place entity import + S3 sync-up happen.
+
+        Lock → git pull (stash, merge, pop) → if conflicts: return early.
+        If clean: git push → S3 sync up → entity import.
+        Returns SyncResult.
         """
-        Pull remote changes. On success, import entities.
-        On conflict, return PullResult with conflicts list.
-        """
-        from src.models.contracts.github import PullResult
+        from src.models.contracts.github import SyncResult
+
+        async def _progress(phase: str) -> None:
+            if job_id:
+                from src.core.pubsub import publish_git_progress
+                await publish_git_progress(job_id, phase)
 
         try:
-            async with self.repo_manager.checkout() as work_dir:
-                repo = self._open_or_init(work_dir)
-                return await self._do_pull(work_dir, repo, job_id)
-        except Exception as e:
-            logger.error(f"Pull failed: {e}", exc_info=True)
-            return PullResult(success=False, error=str(e))
-
-    async def desktop_push(self) -> "PushResult":
-        """Push existing local commits to remote. Does NOT commit first."""
-        from src.models.contracts.github import PushResult
-
-        try:
-            async with self.repo_manager.checkout() as work_dir:
-                repo = self._open_or_init(work_dir)
-                return self._do_push(work_dir, repo)
-        except Exception as e:
-            logger.error(f"Push failed: {e}", exc_info=True)
-            return PushResult(success=False, error=str(e))
-
-    async def desktop_fetch_and_status(self) -> tuple["FetchResult", "WorkingTreeStatus"]:
-        """Fetch + status in a single checkout. Used by sync_preview."""
-        from src.models.contracts.github import FetchResult, WorkingTreeStatus
-
-        try:
-            async with self.repo_manager.checkout() as work_dir:
-                repo = self._open_or_init(work_dir)
-                await self._regenerate_manifest_to_dir(self.db, work_dir)
-                fetch_result = self._do_fetch(work_dir, repo)
-                status_result = self._do_status(work_dir, repo)
-                return fetch_result, status_result
-        except Exception as e:
-            logger.error(f"Fetch+status failed: {e}", exc_info=True)
-            return (
-                FetchResult(success=False, error=str(e)),
-                WorkingTreeStatus(),
-            )
-
-    async def desktop_sync_execute(
-        self,
-        message: str,
-        job_id: str | None = None,
-        conflict_resolutions: dict[str, str] | None = None,
-    ) -> tuple["CommitResult", "PullResult", "PushResult", "ResolveResult | None"]:
-        """Commit + pull + push in a single checkout. Used by sync_execute.
-
-        Returns (commit_result, pull_result, push_result, resolve_result).
-        resolve_result is non-None only if conflicts were auto-resolved.
-        """
-        from src.models.contracts.github import CommitResult, PullResult, PushResult
-
-        try:
-            async with self.repo_manager.checkout() as work_dir:
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
 
-                # Step 1: Commit
-                commit_result = await self._do_commit(work_dir, repo, message)
-
-                # Step 2: Pull
+                # Step 1: Pull (fetch + merge, stash local changes)
                 pull_result = await self._do_pull(work_dir, repo, job_id)
 
                 if not pull_result.success:
-                    if pull_result.conflicts and conflict_resolutions:
-                        # Resolve conflicts inline
-                        resolve_result = self._do_resolve(work_dir, repo, conflict_resolutions)
-                        if not resolve_result.success:
-                            return commit_result, pull_result, PushResult(success=False), resolve_result
-                        # After resolution, import entities
-                        async with self.db.begin_nested():
-                            await self._import_all_entities(work_dir)
-                            await self._delete_removed_entities(work_dir)
-                            await self._update_file_index(work_dir)
-                        await self.db.commit()
-                        await self._sync_app_previews(work_dir)
-                        # Fall through to push
-                    else:
-                        # Unresolved conflicts or other failure
-                        return commit_result, pull_result, PushResult(success=False), None
+                    if pull_result.conflicts:
+                        # Return conflicts to UI — user resolves via desktop_resolve
+                        return SyncResult(
+                            success=False,
+                            pull_success=False,
+                            conflicts=pull_result.conflicts,
+                            error="Merge conflicts detected",
+                        )
+                    return SyncResult(
+                        success=False,
+                        pull_success=False,
+                        error=pull_result.error,
+                    )
 
-                else:
-                    resolve_result = None
-
-                # Step 3: Push
+                # Step 2: Push
+                await _progress("Pushing to remote...")
                 push_result = self._do_push(work_dir, repo)
-                return commit_result, pull_result, push_result, resolve_result if not pull_result.success else None
+
+                if not push_result.success:
+                    return SyncResult(
+                        success=False,
+                        pull_success=True,
+                        push_success=False,
+                        error=push_result.error,
+                    )
+
+                # Step 3: S3 sync up (so other containers see the changes)
+                await _progress("Syncing to storage...")
+                await self.repo_manager.sync_up(work_dir)
+
+                # Step 4: Entity import
+                await _progress("Importing entities...")
+                async with self.db.begin_nested():
+                    entities_imported = await self._import_all_entities(work_dir)
+                    await self._delete_removed_entities(work_dir)
+                    await self._update_file_index(work_dir)
+                await self.db.commit()
+
+                # Step 5: Sync app previews
+                await self._sync_app_previews(work_dir)
+
+                logger.info(
+                    f"Sync complete: pushed={push_result.pushed_commits}, "
+                    f"imported={entities_imported}, sha={push_result.commit_sha}"
+                )
+                return SyncResult(
+                    success=True,
+                    pulled=pull_result.pulled,
+                    pushed_commits=push_result.pushed_commits,
+                    commit_sha=push_result.commit_sha,
+                    entities_imported=entities_imported,
+                )
         except Exception as e:
-            logger.error(f"Sync execute failed: {e}", exc_info=True)
-            return (
-                CommitResult(success=False, error=str(e)),
-                PullResult(success=False, error=str(e)),
-                PushResult(success=False, error=str(e)),
-                None,
-            )
+            logger.error(f"Sync failed: {e}", exc_info=True)
+            return SyncResult(success=False, error=str(e))
+
+    async def desktop_abort_merge(self) -> "AbortMergeResult":
+        """Abort an in-progress merge. Returns to pre-pull state."""
+        from src.models.contracts.github import AbortMergeResult
+
+        try:
+            async with self.repo_manager.lock() as work_dir:
+                repo = self._open_or_init(work_dir)
+
+                merge_head = work_dir / ".git" / "MERGE_HEAD"
+                if not merge_head.exists():
+                    return AbortMergeResult(success=False, error="No merge in progress")
+
+                repo.git.merge("--abort")
+                logger.info("Merge aborted successfully")
+                return AbortMergeResult(success=True)
+        except Exception as e:
+            logger.error(f"Abort merge failed: {e}", exc_info=True)
+            return AbortMergeResult(success=False, error=str(e))
 
     def _do_resolve(self, work_dir: Path, repo: GitRepo, resolutions: dict[str, str]) -> "ResolveResult":
         """Core resolve logic for inline conflict resolution during sync_execute."""
@@ -720,11 +998,18 @@ class GitHubSyncService:
             return ResolveResult(success=False, error="No conflicts to resolve")
 
         for cpath, resolution in resolutions.items():
-            if resolution == "ours":
-                repo.git.checkout("--ours", cpath)
-            elif resolution == "theirs":
-                repo.git.checkout("--theirs", cpath)
-            repo.git.add(cpath)
+            try:
+                if resolution == "ours":
+                    repo.git.checkout("--ours", cpath)
+                elif resolution == "theirs":
+                    repo.git.checkout("--theirs", cpath)
+                repo.git.add(cpath)
+            except Exception:
+                # DU/UD conflict — one side deleted, checkout fails
+                try:
+                    repo.git.rm(cpath)
+                except Exception:
+                    repo.git.add(cpath)
 
         if is_merge:
             repo.index.commit("Merge with conflict resolution")
@@ -736,12 +1021,13 @@ class GitHubSyncService:
     async def desktop_resolve(self, resolutions: dict[str, str]) -> "ResolveResult":
         """
         Resolve merge conflicts after a failed pull.
-        Applies ours/theirs per file, completes the merge, imports entities.
+        Applies ours/theirs per file, creates a merge commit.
+        NO push, NO S3 sync, NO entity import — those happen when user pushes via sync.
         """
         from src.models.contracts.github import ResolveResult
 
         try:
-            async with self.repo_manager.checkout() as work_dir:
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
 
                 # Check for merge state or unmerged entries (stash pop conflicts)
@@ -754,41 +1040,51 @@ class GitHubSyncService:
 
                 # Apply resolutions
                 for cpath, resolution in resolutions.items():
-                    if resolution == "ours":
-                        repo.git.checkout("--ours", cpath)
-                    elif resolution == "theirs":
-                        repo.git.checkout("--theirs", cpath)
-                    repo.git.add(cpath)
+                    try:
+                        if resolution == "ours":
+                            repo.git.checkout("--ours", cpath)
+                        elif resolution == "theirs":
+                            repo.git.checkout("--theirs", cpath)
+                        repo.git.add(cpath)
+                    except Exception:
+                        # DU/UD conflict — one side deleted, checkout fails
+                        try:
+                            repo.git.rm(cpath)
+                        except Exception:
+                            repo.git.add(cpath)
 
-                # Complete the operation
+                # Complete the operation (merge commit is local)
                 if is_merge:
-                    repo.index.commit("Merge with conflict resolution")
+                    # Use git commit (not index.commit) to properly finalize
+                    # the merge — this cleans up MERGE_HEAD, MERGE_MSG, etc.
+                    repo.git.commit("-m", "Merge with conflict resolution")
                 else:
-                    # Stash pop conflict — merge already succeeded, just commit resolved files
                     repo.index.commit("Apply stashed changes with conflict resolution")
 
-                # Import entities atomically with savepoint
-                async with self.db.begin_nested():
-                    pulled = await self._import_all_entities(work_dir)
-                    await self._delete_removed_entities(work_dir)
-                    await self._update_file_index(work_dir)
-                await self.db.commit()
+                # Compute ahead/behind so the UI can update immediately
+                ahead = 0
+                behind = 0
+                try:
+                    ahead = int(repo.git.rev_list("--count", f"origin/{self.branch}..HEAD"))
+                except Exception:
+                    pass
+                try:
+                    behind = int(repo.git.rev_list("--count", f"HEAD..origin/{self.branch}"))
+                except Exception:
+                    pass
 
-                # Sync app preview files from repo to _apps/{id}/preview/
-                await self._sync_app_previews(work_dir)
-
-                logger.info(f"Resolved conflicts, imported {pulled} entities")
-                return ResolveResult(success=True, pulled=pulled)
+                logger.info("Resolved conflicts, created merge commit (local)")
+                return ResolveResult(success=True, commits_ahead=ahead, commits_behind=behind)
         except Exception as e:
             logger.error(f"Resolve failed: {e}", exc_info=True)
             return ResolveResult(success=False, error=str(e))
 
     async def desktop_diff(self, path: str) -> "DiffResult":
-        """Get file diff: HEAD content vs working tree content."""
+        """Get file diff: HEAD content vs working tree content. No S3 sync."""
         from src.models.contracts.github import DiffResult
 
         try:
-            async with self.repo_manager.checkout_readonly() as work_dir:
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
 
                 # Get HEAD content
@@ -815,11 +1111,11 @@ class GitHubSyncService:
             return DiffResult(path=path)
 
     async def desktop_discard(self, paths: list[str]) -> "DiscardResult":
-        """Discard working tree changes for specific files (git checkout -- <path>)."""
+        """Discard working tree changes for specific files. S3 sync up so API sees revert."""
         from src.models.contracts.github import DiscardResult
 
         try:
-            async with self.repo_manager.checkout() as work_dir:
+            async with self.repo_manager.lock() as work_dir:
                 repo = self._open_or_init(work_dir)
                 discarded = []
 
@@ -840,6 +1136,9 @@ class GitHubSyncService:
                             discarded.append(path)
                     except Exception as e:
                         logger.warning(f"Failed to discard {path}: {e}")
+
+                # S3 sync up so other containers see the reverted files
+                await self.repo_manager.sync_up(work_dir)
 
                 logger.info(f"Discarded {len(discarded)} file(s)")
                 return DiscardResult(success=True, discarded=discarded)
@@ -895,7 +1194,7 @@ class GitHubSyncService:
         """
         return []
 
-    async def _plan_import(self, manifest: "Manifest", work_dir: Path) -> "list[SyncOp]":
+    async def plan_import(self, manifest: "Manifest", work_dir: Path) -> "list[SyncOp]":
         """Build and execute SyncOps for importing a manifest (entities only).
 
         Resolves and immediately executes ops in dependency order.
@@ -1007,7 +1306,7 @@ class GitHubSyncService:
     async def _import_all_entities(self, work_dir: Path) -> int:
         """Import all entities from the working tree into the DB.
 
-        Delegates to _plan_import which resolves and immediately executes ops,
+        Delegates to plan_import which resolves and immediately executes ops,
         then runs indexer side-effects for workflows, forms, and agents.
 
         Import order follows dependency chain:
@@ -1040,8 +1339,8 @@ class GitHubSyncService:
 
         count = 0
 
-        # Run all resolve ops (including immediate execution inside _plan_import)
-        await self._plan_import(manifest, work_dir)
+        # Run all resolve ops (including immediate execution inside plan_import)
+        await self.plan_import(manifest, work_dir)
 
         # Count imported entities
         count += len(manifest.organizations)
@@ -1052,6 +1351,16 @@ class GitHubSyncService:
         count += len(manifest.apps)
         count += len(manifest.tables)
         count += len(manifest.events)
+
+        # Indexer side-effects: WorkflowIndexer for each workflow
+        # Enriches parameters_schema, description, etc. from AST
+        from src.services.file_storage.indexers.workflow import WorkflowIndexer
+        workflow_indexer = WorkflowIndexer(self.db)
+        for _wf_name, mwf in manifest.workflows.items():
+            wf_path = work_dir / mwf.path
+            if wf_path.exists():
+                content = wf_path.read_bytes()
+                await workflow_indexer.index_python_file(mwf.path, content)
 
         # Indexer side-effects: FormIndexer for each form
         from src.services.file_storage.indexers.form import FormIndexer
@@ -1066,7 +1375,7 @@ class GitHubSyncService:
                     # Resolve portable refs (path::function_name) to UUIDs
                     await self._resolve_ref_field(data, "workflow_id")
                     await self._resolve_ref_field(data, "launch_workflow_id")
-                    updated_content = yaml.dump(data, default_flow_style=False, sort_keys=False).encode("utf-8")
+                    updated_content = (yaml.dump(data, default_flow_style=False, sort_keys=False).rstrip() + "\n").encode("utf-8")
                     await form_indexer.index_form(f"forms/{mform.id}.form.yaml", updated_content)
 
                     # Post-indexer: update org_id and access_level (indexer skips these)
@@ -1100,7 +1409,7 @@ class GitHubSyncService:
                     await self._resolve_ref_field(data, "tool_ids")
                     if "tools" in data and "tool_ids" not in data:
                         await self._resolve_ref_field(data, "tools")
-                    updated_content = yaml.dump(data, default_flow_style=False, sort_keys=False).encode("utf-8")
+                    updated_content = (yaml.dump(data, default_flow_style=False, sort_keys=False).rstrip() + "\n").encode("utf-8")
                     await agent_indexer.index_agent(f"agents/{magent.id}.agent.yaml", updated_content)
 
                     # Post-indexer: update org_id and access_level (indexer skips these)
@@ -1193,6 +1502,7 @@ class GitHubSyncService:
 
             # Re-run indexers on all registered workflow files
             await self._reindex_registered_workflows(work_dir)
+            await self.db.commit()
 
             # Sync app preview files
             await self._sync_app_previews(work_dir)
@@ -2027,13 +2337,8 @@ class GitHubSyncService:
         org_id = UUID(mapp.organization_id) if mapp.organization_id else None
         access_level = getattr(mapp, "access_level", "role_based")
 
-        # Two-step: check for existing app by natural key (org_id, slug)
+        # Check for existing app by slug (globally unique)
         existing_query = select(Application.id).where(Application.slug == slug)
-        if org_id:
-            existing_query = existing_query.where(Application.organization_id == org_id)
-        else:
-            existing_query = existing_query.where(Application.organization_id.is_(None))
-
         existing = await self.db.execute(existing_query)
         existing_id = existing.scalar_one_or_none()
 

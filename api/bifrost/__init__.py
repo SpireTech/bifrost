@@ -79,6 +79,7 @@ Example:
 from .ai import ai
 from .config import config
 from .executions import executions
+from .email import email
 from .files import files
 from .forms import forms
 from .integrations import integrations
@@ -108,6 +109,8 @@ from .models import (
     TableInfo,
     DocumentData,
     DocumentList,
+    BatchResult,
+    BatchDeleteResult,
 )
 
 # Import decorators - try platform module first, fall back to local SDK version
@@ -183,6 +186,7 @@ __all__ = [
     # SDK Modules
     'ai',
     'config',
+    'email',
     'executions',
     'files',
     'forms',
@@ -211,6 +215,8 @@ __all__ = [
     'TableInfo',
     'DocumentData',
     'DocumentList',
+    'BatchResult',
+    'BatchDeleteResult',
     # Decorators
     'workflow',
     'data_provider',

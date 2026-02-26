@@ -20,6 +20,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from src.core.auth import Context, CurrentUser
 from src.core.org_filter import OrgFilterType, resolve_org_filter, resolve_target_org
@@ -199,42 +200,6 @@ class ApplicationRepository(OrgScopedRepository[Application]):
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
-    async def get_by_slug(self, slug: str) -> Application | None:
-        """
-        Get application by slug with cascade scoping and role-based access check.
-
-        Prioritizes org-specific over global to avoid MultipleResultsFound
-        when the same slug exists in both scopes.
-
-        Args:
-            slug: Application slug
-
-        Returns:
-            Application if found and accessible, None otherwise
-        """
-        # Build query filtering by slug
-        query = select(self.model).where(self.model.slug == slug)
-
-        # Apply cascade scoping: prioritize org-specific, then global
-        if self.org_id is not None:
-            # Try org-specific first
-            org_query = query.where(self.model.organization_id == self.org_id)
-            result = await self.session.execute(org_query)
-            entity = result.scalar_one_or_none()
-            if entity:
-                if await self._can_access_entity(entity):
-                    return entity
-                return None
-
-        # Fall back to global
-        global_query = query.where(self.model.organization_id.is_(None))
-        result = await self.session.execute(global_query)
-        entity = result.scalar_one_or_none()
-
-        if entity and await self._can_access_entity(entity):
-            return entity
-        return None
-
     async def get_by_id(self, id: UUID) -> Application | None:
         """
         Get application by UUID with cascade scoping and role-based access check.
@@ -271,12 +236,9 @@ class ApplicationRepository(OrgScopedRepository[Application]):
             return entity
         return None
 
-    async def get_by_slug_strict(self, slug: str) -> Application | None:
-        """Get application by slug strictly in current org scope (no fallback)."""
-        query = select(self.model).where(
-            self.model.slug == slug,
-            self.model.organization_id == self.org_id,
-        )
+    async def get_by_slug_global(self, slug: str) -> Application | None:
+        """Check if any application exists with this slug (globally unique)."""
+        query = select(self.model).where(self.model.slug == slug)
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
@@ -293,7 +255,7 @@ class ApplicationRepository(OrgScopedRepository[Application]):
     ) -> Application:
         """Create a new application with access control settings."""
         # Check if application already exists in this scope
-        existing = await self.get_by_slug_strict(data.slug)
+        existing = await self.get_by_slug_global(data.slug)
         if existing:
             raise ValueError(f"Application with slug '{data.slug}' already exists")
 
@@ -353,7 +315,7 @@ class ApplicationRepository(OrgScopedRepository[Application]):
         # Handle slug change with uniqueness check
         if data.slug is not None and data.slug != application.slug:
             # Check if new slug already exists in the same scope
-            existing = await self.get_by_slug_strict(data.slug)
+            existing = await self.get_by_slug_global(data.slug)
             if existing and existing.id != application.id:
                 raise ValueError(f"Application with slug '{data.slug}' already exists")
             application.slug = data.slug
@@ -655,6 +617,12 @@ async def get_application_or_404(
         is_superuser=ctx.user.is_platform_admin,
     )
     try:
+        if ctx.user.is_platform_admin:
+            # Slugs are globally unique — super admins can resolve across orgs
+            app = await repo.get_by_slug_global(slug)
+            if not app:
+                raise AccessDeniedError(f"Application '{slug}' not found")
+            return app
         return await repo.can_access(slug=slug)
     except AccessDeniedError:
         raise HTTPException(
@@ -732,6 +700,11 @@ async def create_application(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
+        )
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Application with slug '{data.slug}' already exists",
         )
 
 
@@ -833,6 +806,11 @@ async def update_application(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
+        )
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Application with slug '{data.slug}' already exists",
         )
 
     if not application:
@@ -1071,18 +1049,6 @@ async def validate_application(
 
         if not (rel_path.endswith(".tsx") or rel_path.endswith(".ts")):
             continue
-
-        # Check for import statements (forbidden in app builder)
-        for i, line in enumerate(content.split("\n"), 1):
-            stripped = line.strip()
-            # Match import statements but not comments
-            if re.match(r'^import\s+', stripped) and not stripped.startswith("//"):
-                errors.append(AppValidationIssue(
-                    severity="error",
-                    file=rel_path,
-                    message=f"Import statements are not allowed: {stripped[:80]}",
-                    line=i,
-                ))
 
         # Check for forbidden patterns
         forbidden = [

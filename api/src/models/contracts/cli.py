@@ -252,6 +252,8 @@ class SDKIntegrationsGetResponse(BaseModel):
     )
     oauth: SDKIntegrationsOAuthData | None = Field(
         None, description="Full OAuth credentials and configuration")
+    config_secret_keys: list[str] = Field(
+        default_factory=list, description="Config keys that contain secret values (for log masking)")
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -555,6 +557,74 @@ class SDKDocumentCountRequest(BaseModel):
     where: dict[str, Any] | None = Field(default=None, description="Filter conditions with operators")
     scope: str | None = Field(default=None, description="Organization scope")
     app: str | None = Field(default=None, description="Application UUID")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKDocumentInsertBatchItem(BaseModel):
+    """Single item in a batch insert request."""
+    id: str | None = Field(default=None, description="Document ID (optional, auto-generated if not provided)")
+    data: dict[str, Any] = Field(..., description="Document data")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKDocumentInsertBatchRequest(BaseModel):
+    """SDK request for batch inserting documents."""
+    table: str = Field(..., description="Table name")
+    documents: list[SDKDocumentInsertBatchItem] = Field(
+        ..., max_length=1000, description="Documents to insert (max 1000)"
+    )
+    scope: str | None = Field(default=None, description="Organization scope")
+    app: str | None = Field(default=None, description="Application UUID")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKDocumentUpsertBatchItem(BaseModel):
+    """Single item in a batch upsert request."""
+    id: str = Field(..., description="Document ID (required for upsert)")
+    data: dict[str, Any] = Field(..., description="Document data")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKDocumentUpsertBatchRequest(BaseModel):
+    """SDK request for batch upserting documents."""
+    table: str = Field(..., description="Table name")
+    documents: list[SDKDocumentUpsertBatchItem] = Field(
+        ..., max_length=1000, description="Documents to upsert (max 1000)"
+    )
+    scope: str | None = Field(default=None, description="Organization scope")
+    app: str | None = Field(default=None, description="Application UUID")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKDocumentDeleteBatchRequest(BaseModel):
+    """SDK request for batch deleting documents."""
+    table: str = Field(..., description="Table name")
+    doc_ids: list[str] = Field(
+        ..., max_length=1000, description="Document IDs to delete (max 1000)"
+    )
+    scope: str | None = Field(default=None, description="Organization scope")
+    app: str | None = Field(default=None, description="Application UUID")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKBatchDocumentResponse(BaseModel):
+    """Batch insert/upsert response."""
+    documents: list["SDKDocumentData"] = Field(..., description="Created/updated documents")
+    count: int = Field(..., description="Number of documents affected")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SDKBatchDeleteResponse(BaseModel):
+    """Batch delete response."""
+    deleted_ids: list[str] = Field(..., description="IDs of deleted documents")
+    count: int = Field(..., description="Number of documents deleted")
 
     model_config = ConfigDict(from_attributes=True)
 

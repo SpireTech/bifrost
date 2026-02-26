@@ -268,6 +268,15 @@ from src.models.contracts.editor import (
     WorkflowIdConflict,
 )
 
+# File Operations (CLI push/pull)
+from src.models.contracts.files import (
+    FilePullRequest,
+    FilePullResponse,
+    FilePushRequest,
+    FilePushResponse,
+    WatchSessionRequest,
+)
+
 # Common models
 from src.models.contracts.common import (
     BrandingSettings,
@@ -329,6 +338,7 @@ from src.models.contracts.github import (
     WorkflowReference,
     WorkspaceAnalysisResponse,
     GitJobResponse,
+    GitOpRequest,
     CommitRequest,
     ResolveRequest,
     DiffRequest,
@@ -341,7 +351,10 @@ from src.models.contracts.github import (
     CommitResult,
     PullResult,
     PushResult,
+    RepoStatusResponse,
     ResolveResult,
+    SyncResult,
+    AbortMergeResult,
     DiffResult,
     SyncExecuteRequest,
 )
@@ -725,6 +738,7 @@ __all__ = [
     "FetchFromGitHubResponse",
     "GitHubSetupResponse",
     "GitRefreshStatusResponse",
+    "RepoStatusResponse",
     "CommitHistoryResponse",
     "CommitInfo",
     "DetectedRepoInfo",
@@ -745,6 +759,7 @@ __all__ = [
     "DeactivateWorkflowResponse",
     # Desktop-style git sync models
     "GitJobResponse",
+    "GitOpRequest",
     "CommitRequest",
     "ResolveRequest",
     "DiffRequest",
@@ -758,6 +773,8 @@ __all__ = [
     "PullResult",
     "PushResult",
     "ResolveResult",
+    "SyncResult",
+    "AbortMergeResult",
     "DiffResult",
     "SyncExecuteRequest",
     # CLI Models
@@ -916,6 +933,12 @@ __all__ = [
     "RecycleProcessResponse",
     "StuckHistoryResponse",
     "StuckWorkflowStats",
+    # File Operations (CLI push/pull)
+    "FilePushRequest",
+    "FilePushResponse",
+    "FilePullRequest",
+    "FilePullResponse",
+    "WatchSessionRequest",
     # Export/Import
     "ExportMetadata",
     "KnowledgeExportFile",

@@ -10,15 +10,23 @@ Auth: CurrentSuperuser (platform admins and workflow engine)
 
 import base64
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.auth import Context, CurrentSuperuser
+from src.models.contracts.files import (
+    FilePullRequest,
+    FilePullResponse,
+    FilePushRequest,
+    FilePushResponse,
+    WatchSessionRequest,
+)
 from src.core.database import get_db
 from src.models import (
     AffectedEntity,
@@ -37,6 +45,9 @@ from src.models import (
 from src.services.editor.search import search_files_db
 from src.services.file_backend import get_backend
 from src.services.file_storage import FileStorageService
+
+# Watch session TTL — must be > CLI heartbeat interval (WATCH_HEARTBEAT_SECONDS in bifrost.cli)
+WATCH_SESSION_TTL_SECONDS = 120
 
 logger = logging.getLogger(__name__)
 
@@ -105,22 +116,19 @@ class FileExistsResponse(BaseModel):
     exists: bool = Field(..., description="True if file exists")
 
 
-class FilePushRequest(BaseModel):
-    """Request to push multiple files to _repo/."""
-    files: dict[str, str] = Field(..., description="Map of repo_path to content")
-    delete_missing_prefix: str | None = Field(
-        default=None,
-        description="If set, delete files under this prefix not in the push batch",
-    )
+class SignedUrlRequest(BaseModel):
+    """Request to generate a presigned S3 URL."""
+    path: str = Field(..., description="File path (scoped automatically by org)")
+    method: Literal["PUT", "GET"] = Field(default="PUT", description="HTTP method: PUT for upload, GET for download")
+    content_type: str = Field(default="application/octet-stream", description="MIME type (only used for PUT)")
+    scope: str | None = Field(default=None, description="Organization scope (auto-resolved from context if None)")
 
 
-class FilePushResponse(BaseModel):
-    """Response for file push."""
-    created: int = 0
-    updated: int = 0
-    deleted: int = 0
-    unchanged: int = 0
-    errors: list[str] = Field(default_factory=list)
+class SignedUrlResponse(BaseModel):
+    """Response with presigned URL."""
+    url: str = Field(..., description="Presigned S3 URL")
+    path: str = Field(..., description="Full S3 path")
+    expires_in: int = Field(default=600, description="URL expiration in seconds")
 
 
 # =============================================================================
@@ -255,6 +263,53 @@ async def file_exists(
         )
 
 
+RESERVED_PREFIXES = ("_repo/", "_apps/", "_tmp/")
+
+@router.post("/signed-url", response_model=SignedUrlResponse)
+async def get_signed_url(
+    request: SignedUrlRequest,
+    ctx: Context,
+    user: CurrentSuperuser,
+    db: AsyncSession = Depends(get_db),
+) -> SignedUrlResponse:
+    """Generate a presigned S3 URL for direct file upload or download."""
+    # Validate path - no traversal
+    if ".." in request.path or request.path.startswith("/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid path: must be relative and cannot contain '..'",
+        )
+
+    # Block reserved prefixes
+    for prefix in RESERVED_PREFIXES:
+        if request.path.startswith(prefix):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid path: '{prefix}' is a reserved prefix",
+            )
+
+    # Build scoped S3 path
+    scope = request.scope or "global"
+    s3_path = f"uploads/{scope}/{request.path}"
+
+    file_storage = FileStorageService(db)
+
+    if request.method == "PUT":
+        url = await file_storage.generate_presigned_upload_url(
+            path=s3_path,
+            content_type=request.content_type,
+        )
+    else:
+        url = await file_storage.generate_presigned_download_url(
+            path=s3_path,
+        )
+
+    return SignedUrlResponse(
+        url=url,
+        path=s3_path,
+    )
+
+
 # =============================================================================
 # Batch Push Endpoint (CLI-focused)
 # =============================================================================
@@ -263,6 +318,7 @@ async def file_exists(
 @router.post("/push", response_model=FilePushResponse)
 async def push_files(
     request: FilePushRequest,
+    request_obj: Request,
     ctx: Context,
     user: CurrentSuperuser,
     db: AsyncSession = Depends(get_db),
@@ -281,10 +337,21 @@ async def push_files(
     unchanged = 0
     deleted = 0
     errors = []
+    warnings = []
 
+    # Partition files into .bifrost/ manifest files vs regular files
+    bifrost_files: dict[str, str] = {}
+    regular_files: dict[str, str] = {}
     for repo_path, content in request.files.items():
+        parts = repo_path.replace("\\", "/").split("/")
+        if ".bifrost" in parts:
+            bifrost_files[repo_path] = content
+        else:
+            regular_files[repo_path] = content
+
+    # Process regular files (existing logic)
+    for repo_path, content in regular_files.items():
         try:
-            # Check if file already exists with same content
             from src.models.orm.file_index import FileIndex
             from sqlalchemy import select
 
@@ -293,7 +360,6 @@ async def push_files(
             )
             existing_hash = existing.scalar_one_or_none()
 
-            # Compute hash of new content
             content_bytes = content.encode("utf-8")
             new_hash = hashlib.sha256(content_bytes).hexdigest()
 
@@ -302,11 +368,17 @@ async def push_files(
                 continue
 
             was_new = existing_hash is None
-            await file_storage.write_file(
+            write_result = await file_storage.write_file(
                 path=repo_path,
                 content=content_bytes,
                 updated_by=user.email or "cli",
+                skip_dirty_flag=True,
             )
+
+            # Collect diagnostics as warnings
+            if write_result.diagnostics:
+                for d in write_result.diagnostics:
+                    warnings.append(f"{repo_path}:{d.line or 0}: [{d.severity}] {d.message}")
 
             if was_new:
                 created += 1
@@ -317,7 +389,7 @@ async def push_files(
             logger.warning(f"Error pushing file {repo_path}: {e}")
             errors.append(f"{repo_path}: {str(e)}")
 
-    # Handle delete_missing_prefix
+    # Handle delete_missing_prefix (exclude .bifrost/ from deletion)
     if request.delete_missing_prefix:
         prefix = request.delete_missing_prefix
         if not prefix.endswith("/"):
@@ -333,6 +405,10 @@ async def push_files(
         push_paths = set(request.files.keys())
 
         for path_to_delete in existing_paths - push_paths:
+            # Don't delete .bifrost/ files via prefix cleanup
+            parts = path_to_delete.replace("\\", "/").split("/")
+            if ".bifrost" in parts:
+                continue
             try:
                 await file_storage.delete_file(path_to_delete)
                 deleted += 1
@@ -340,7 +416,80 @@ async def push_files(
                 logger.warning(f"Error deleting file {path_to_delete}: {e}")
                 errors.append(f"delete {path_to_delete}: {str(e)}")
 
+    # Process .bifrost/ manifest files
+    manifest_applied = False
+    manifest_files_response: dict[str, str] = {}
+    modified_files_response: dict[str, str] = {}
+
+    if bifrost_files:
+        from src.services.repo_storage import RepoStorage
+        from src.services.github_sync import import_manifest_from_repo
+
+        repo = RepoStorage()
+
+        # Write .bifrost/ files to S3 (not counted in created/updated tallies)
+        for repo_path, content in bifrost_files.items():
+            try:
+                content_bytes = content.encode("utf-8")
+                # Normalize: strip any prefix before .bifrost/ to prevent
+                # duplicates from clients sending prefixed manifest paths
+                parts = repo_path.replace("\\", "/").split("/")
+                try:
+                    bifrost_idx = parts.index(".bifrost")
+                    canonical_path = "/".join(parts[bifrost_idx:])
+                except ValueError:
+                    canonical_path = repo_path
+                await repo.write(canonical_path, content_bytes)
+            except Exception as e:
+                logger.warning(f"Error writing manifest file {repo_path}: {e}")
+                errors.append(f"{repo_path}: {str(e)}")
+
+        # Import manifest from repo (reads .bifrost/ from S3, resolves to DB)
+        try:
+            import_result = await import_manifest_from_repo(db)
+            manifest_applied = import_result.applied
+            warnings.extend(import_result.warnings)
+
+            # Only return manifest files that differ from what was pushed
+            pushed_hashes: dict[str, str] = {}
+            for rp, c in bifrost_files.items():
+                # Normalize key to just the filename (e.g. "workflows.yaml")
+                parts = rp.replace("\\", "/").split("/")
+                try:
+                    idx = parts.index(".bifrost")
+                    fname = "/".join(parts[idx + 1:])
+                    pushed_hashes[fname] = hashlib.sha256(c.encode("utf-8")).hexdigest()
+                except ValueError:
+                    pass
+            for filename, content in import_result.manifest_files.items():
+                regen_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if pushed_hashes.get(filename) != regen_hash:
+                    manifest_files_response[filename] = content
+
+            modified_files_response = import_result.modified_files
+        except Exception as e:
+            logger.warning(f"Error importing manifest: {e}")
+            warnings.append(f"Manifest import failed: {str(e)}")
+
     await db.commit()
+
+    # Broadcast file activity to admins
+    total_changed = created + updated + deleted
+    if total_changed > 0:
+        from src.core.pubsub import publish_file_activity
+        is_watch = request_obj.headers.get("X-Bifrost-Watch") == "true"
+        prefix = request.delete_missing_prefix or next(iter(request.files.keys()), "").rsplit("/", 1)[0]
+        try:
+            await publish_file_activity(
+                user_id=str(user.user_id),
+                user_name=user.name or user.email or "CLI",
+                activity_type="file_push",
+                prefix=prefix,
+                file_count=total_changed,
+                is_watch=is_watch,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast file activity: {e}")
 
     return FilePushResponse(
         created=created,
@@ -348,7 +497,130 @@ async def push_files(
         deleted=deleted,
         unchanged=unchanged,
         errors=errors,
+        warnings=warnings,
+        manifest_applied=manifest_applied,
+        manifest_files=manifest_files_response,
+        modified_files=modified_files_response,
     )
+
+
+# =============================================================================
+# Pull & Manifest Endpoints (CLI-focused)
+# =============================================================================
+
+
+@router.post("/pull", response_model=FilePullResponse)
+async def pull_files(
+    request: FilePullRequest,
+    ctx: Context,
+    user: CurrentSuperuser,
+    db: AsyncSession = Depends(get_db),
+) -> FilePullResponse:
+    """
+    Pull manifest files from server that differ from local state.
+
+    Only returns regenerated .bifrost/*.yaml from DB state.
+    Code file reconciliation is handled by git, not by this endpoint.
+    """
+    from src.services.manifest_generator import generate_manifest
+    from src.services.manifest import serialize_manifest_dir
+
+    manifest_files: dict[str, str] = {}
+    try:
+        manifest = await generate_manifest(db)
+        all_manifest_files = serialize_manifest_dir(manifest)
+        for filename, content in all_manifest_files.items():
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            local_hash = None
+            for key_candidate in [
+                f".bifrost/{filename}",
+                f"{request.prefix}/.bifrost/{filename}" if request.prefix else None,
+                f"{request.prefix.rstrip('/')}/.bifrost/{filename}" if request.prefix else None,
+            ]:
+                if key_candidate and key_candidate in request.local_hashes:
+                    local_hash = request.local_hashes[key_candidate]
+                    break
+            if local_hash != content_hash:
+                manifest_files[filename] = content
+    except Exception as e:
+        logger.warning(f"Error generating manifest: {e}")
+
+    return FilePullResponse(
+        files={},
+        deleted=[],
+        manifest_files=manifest_files,
+    )
+
+
+@router.get("/manifest")
+async def get_manifest(
+    ctx: Context,
+    user: CurrentSuperuser,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """Return regenerated manifest files from DB state."""
+    from src.services.manifest_generator import generate_manifest
+    from src.services.manifest import serialize_manifest_dir
+
+    manifest = await generate_manifest(db)
+    return serialize_manifest_dir(manifest)
+
+
+# =============================================================================
+# Watch Session Endpoints (CLI watch mode)
+# =============================================================================
+
+
+@router.post("/watch")
+async def manage_watch_session(
+    request: WatchSessionRequest,
+    user: CurrentSuperuser,
+) -> dict:
+    """Register, heartbeat, or deregister a CLI watch session."""
+    from src.core.cache.redis_client import get_shared_redis
+    from src.core.pubsub import publish_file_activity
+
+    key = f"bifrost:watch:{user.user_id}:{request.prefix}"
+    r = await get_shared_redis()
+
+    if request.action in ("start", "heartbeat"):
+        await r.setex(key, WATCH_SESSION_TTL_SECONDS, json.dumps({
+            "user_id": str(user.user_id),
+            "user_name": user.name or user.email or "CLI",
+            "prefix": request.prefix,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }))
+        if request.action == "start":
+            await publish_file_activity(
+                user_id=str(user.user_id),
+                user_name=user.name or user.email or "CLI",
+                activity_type="watch_start",
+                prefix=request.prefix,
+            )
+    elif request.action == "stop":
+        await r.delete(key)
+        await publish_file_activity(
+            user_id=str(user.user_id),
+            user_name=user.name or user.email or "CLI",
+            activity_type="watch_stop",
+            prefix=request.prefix,
+        )
+    return {"ok": True}
+
+
+@router.get("/watchers")
+async def list_active_watchers(user: CurrentSuperuser) -> dict:
+    """List active CLI watch sessions."""
+    from src.core.cache.redis_client import get_shared_redis
+
+    r = await get_shared_redis()
+    keys = [k async for k in r.scan_iter("bifrost:watch:*")]
+    watchers = []
+    for key in keys:
+        data = await r.get(key)
+        if data:
+            watchers.append(json.loads(data))
+    return {"watchers": watchers}
 
 
 # =============================================================================

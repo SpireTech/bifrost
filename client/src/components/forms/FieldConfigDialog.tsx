@@ -328,11 +328,11 @@ function FieldConfigDialogContent({
 			validation: null,
 			data_provider_id: dataProvider ?? null,
 			default_value:
-			type === "checkbox"
-				? (defaultValue as boolean)
-				: defaultValue !== ""
-					? defaultValue
-					: null,
+				type === "checkbox"
+					? (defaultValue as boolean)
+					: defaultValue !== ""
+						? defaultValue
+						: null,
 			placeholder: placeholder || null,
 			help_text: helpText || null,
 			// NEW MVP fields
@@ -695,9 +695,9 @@ function FieldConfigDialogContent({
 										<div className="flex items-center space-x-2 pt-1">
 											<Checkbox
 												id="defaultValue"
-												checked={defaultValue as boolean}
+												checked={defaultValue === true}
 												onCheckedChange={(checked) =>
-													setDefaultValue(checked as boolean)
+													setDefaultValue(checked === true)
 												}
 											/>
 											<Label

@@ -12,9 +12,11 @@ to avoid dependencies on src.* modules that only exist in the Docker environment
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
+import pathlib
 import sys
 import time
 import webbrowser
@@ -28,50 +30,18 @@ import httpx
 import bifrost.credentials as credentials
 from bifrost.client import BifrostClient
 
+# Shared constants for file operations
+BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+    ".woff", ".woff2", ".ttf", ".eot",
+    ".zip", ".tar", ".gz", ".bz2",
+    ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin",
+})
 
-async def refresh_tokens() -> bool:
-    """
-    Refresh access token using refresh token.
+KNOWN_ROOTS = frozenset({"apps", "workflows", "modules", "agents", "forms", ".bifrost"})
 
-    Uses credentials from credentials file.
-    Updates credentials file with new tokens.
-
-    Returns:
-        True if refresh successful, False otherwise
-    """
-    creds = credentials.get_credentials()
-    if not creds:
-        return False
-
-    api_url = creds["api_url"]
-    refresh_token = creds["refresh_token"]
-
-    try:
-        async with httpx.AsyncClient(base_url=api_url, timeout=30.0) as client:
-            response = await client.post(
-                "/auth/refresh",
-                json={"refresh_token": refresh_token}
-            )
-
-            if response.status_code != 200:
-                return False
-
-            data = response.json()
-
-            # Calculate expiry time (30 minutes from now)
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 1800))
-
-            # Save new credentials
-            credentials.save_credentials(
-                api_url=api_url,
-                access_token=data["access_token"],
-                refresh_token=data["refresh_token"],
-                expires_at=expires_at.isoformat(),
-            )
-
-            return True
-    except Exception:
-        return False
+# Watch session heartbeat must be < Redis TTL (WATCH_SESSION_TTL_SECONDS in files.py)
+WATCH_HEARTBEAT_SECONDS = 60
 
 
 async def login_flow(api_url: str | None = None, auto_open: bool = True) -> bool:
@@ -252,6 +222,12 @@ def main(args: list[str] | None = None) -> int:
     if command == "push":
         return handle_push(args[1:])
 
+    if command == "watch":
+        return handle_watch(args[1:])
+
+    if command == "api":
+        return handle_api(args[1:])
+
     # Unknown command
     print(f"Unknown command: {command}", file=sys.stderr)
     print_help()
@@ -270,6 +246,8 @@ Commands:
   run         Run a workflow file with web-based parameter input
   sync        Sync with Bifrost platform via GitHub
   push        Push local files to Bifrost platform
+  watch       Watch for file changes and auto-push (requires .bifrost/ workspace)
+  api         Generic authenticated API request
   login       Authenticate with device authorization flow
   logout      Clear stored credentials and sign out
   help        Show this help message
@@ -282,6 +260,10 @@ Examples:
   bifrost sync --resolve workflows/billing.py=keep_remote
   bifrost push apps/my-app
   bifrost push apps/my-app --clean
+  bifrost watch
+  bifrost watch apps/my-app
+  bifrost api GET /api/workflows
+  bifrost api POST /api/applications/my-app/validate
   bifrost login
   bifrost login --url https://app.gobifrost.com
   bifrost logout
@@ -792,22 +774,48 @@ def handle_push(args: list[str]) -> int:
     Handle 'bifrost push' command.
 
     Pushes local files to Bifrost _repo/ via the /api/files/push endpoint.
+    Gates on repo-status check (git must be configured, no uncommitted platform changes).
 
     Usage:
       bifrost push <path> [--clean] [--validate]
 
     Args:
-      path: Local directory to push (e.g., apps/my-app, workflows/)
+      path: Local directory to push (defaults to ".")
       --clean: Delete remote files not present locally
       --validate: Validate after push (for apps)
     """
-    if not args:
-        print("Usage: bifrost push <path> [--clean] [--validate]", file=sys.stderr)
-        return 1
+    if args and args[0] in ("--help", "-h"):
+        print("""
+Usage: bifrost push [path] [options]
+
+Push local files to Bifrost platform.
+
+Before pushing, checks that:
+  1. Git integration is configured
+  2. No uncommitted platform changes exist (run 'bifrost sync' first)
+
+Arguments:
+  path                  Local directory to push (default: current directory)
+
+Options:
+  --clean               Delete remote files not present locally
+  --validate            Validate after push (for apps)
+  --force               Skip repo dirty check
+  --help, -h            Show this help message
+
+Use 'bifrost watch' for continuous file watching.
+
+Examples:
+  bifrost push apps/my-app
+  bifrost push apps/my-app --clean
+  bifrost push .
+""".strip())
+        return 0
 
     local_path = None
     clean = False
     validate = False
+    force = False
 
     i = 0
     while i < len(args):
@@ -816,6 +824,11 @@ def handle_push(args: list[str]) -> int:
             clean = True
         elif arg == "--validate":
             validate = True
+        elif arg == "--watch":
+            print("--watch has moved to its own command: bifrost watch", file=sys.stderr)
+            return 1
+        elif arg == "--force":
+            force = True
         elif arg.startswith("--"):
             print(f"Unknown option: {arg}", file=sys.stderr)
             return 1
@@ -827,13 +840,723 @@ def handle_push(args: list[str]) -> int:
         i += 1
 
     if not local_path:
-        print("Error: path argument required", file=sys.stderr)
+        local_path = "."
+
+    # Authenticate BEFORE entering asyncio.run() so token refresh works
+    # (refresh_tokens() uses asyncio.run() internally, which fails inside a running loop)
+    try:
+        client = BifrostClient.get_instance(require_auth=True)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    return asyncio.run(_push_files(local_path, clean=clean, validate=validate))
+    try:
+        return asyncio.run(_push_with_precheck(
+            local_path, clean=clean, validate=validate, watch=False, force=force,
+            client=client,
+        ))
+    except KeyboardInterrupt:
+        return 130
 
 
-async def _push_files(local_path: str, clean: bool = False, validate: bool = False) -> int:
+def handle_watch(args: list[str]) -> int:
+    """
+    Handle 'bifrost watch' command.
+
+    Watches a Bifrost workspace for file changes and auto-pushes.
+    Requires the directory to contain a .bifrost/ directory (workspace root).
+
+    Usage:
+      bifrost watch [path] [--clean] [--validate] [--force]
+    """
+    if args and args[0] in ("--help", "-h"):
+        print("""
+Usage: bifrost watch [path] [options]
+
+Watch for file changes and auto-push to Bifrost platform.
+Must be run from a Bifrost workspace (directory containing .bifrost/).
+
+Arguments:
+  path                  Local directory to watch (default: current directory)
+
+Options:
+  --clean               Delete remote files not present locally
+  --validate            Validate after push (for apps)
+  --force               Skip repo dirty check
+  --help, -h            Show this help message
+
+Examples:
+  bifrost watch
+  bifrost watch apps/my-app
+  bifrost watch --clean
+""".strip())
+        return 0
+
+    local_path = None
+    clean = False
+    validate = False
+    force = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--clean":
+            clean = True
+        elif arg == "--validate":
+            validate = True
+        elif arg == "--force":
+            force = True
+        elif arg.startswith("--"):
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            return 1
+        elif local_path is None:
+            local_path = arg
+        else:
+            print(f"Unexpected argument: {arg}", file=sys.stderr)
+            return 1
+        i += 1
+
+    if not local_path:
+        local_path = "."
+
+    # Resolve path and verify .bifrost/ exists
+    resolved = pathlib.Path(local_path).resolve()
+    if not resolved.exists() or not resolved.is_dir():
+        print(f"Error: {local_path} is not a valid directory", file=sys.stderr)
+        return 1
+
+    bifrost_dir = _find_bifrost_dir(resolved)
+    if not bifrost_dir.exists() or not bifrost_dir.is_dir():
+        print("Error: not a Bifrost workspace (no .bifrost/ directory found)", file=sys.stderr)
+        print("  Run 'bifrost watch' from a directory that contains .bifrost/,", file=sys.stderr)
+        print("  or run 'bifrost sync' to initialize your workspace first.", file=sys.stderr)
+        return 1
+
+    # Authenticate
+    try:
+        client = BifrostClient.get_instance(require_auth=True)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    repo_prefix = _detect_repo_prefix(resolved)
+    try:
+        return asyncio.run(_push_with_precheck(
+            local_path, clean=clean, validate=validate, watch=True, force=force,
+            client=client,
+        ))
+    except KeyboardInterrupt:
+        print("\nStopping watch...", flush=True)
+        try:
+            client.post_sync("/api/files/watch", json={
+                "action": "stop", "prefix": repo_prefix,
+            })
+        except Exception:
+            pass
+        return 130
+
+
+async def _check_repo_status(client: BifrostClient) -> bool:
+    """Check if repo is clean enough to push. Returns True if OK to proceed."""
+    try:
+        response = await client.get("/api/github/repo-status")
+        if response.status_code != 200:
+            print("Warning: could not check repo status. Proceeding anyway.", file=sys.stderr)
+            return True
+
+        data = response.json()
+
+        if not data.get("git_configured"):
+            print("Error: Git is not configured. Set up GitHub integration first.", file=sys.stderr)
+            print("  Configure at: Settings > GitHub", file=sys.stderr)
+            return False
+
+        if data.get("dirty"):
+            since = data.get("dirty_since", "unknown")
+            print(f"Platform has uncommitted changes (since {since}).", file=sys.stderr)
+            print("  Run 'bifrost sync' to commit platform changes first,", file=sys.stderr)
+            print("  then 'git pull' locally to get them.", file=sys.stderr)
+            print("  Or use --force to push anyway (platform changes will be overwritten).", file=sys.stderr)
+            return False
+
+        return True
+    except Exception as e:
+        print(f"Warning: could not check repo status: {e}. Proceeding anyway.", file=sys.stderr)
+        return True
+
+
+def _detect_repo_prefix(path: pathlib.Path) -> str:
+    """Detect the repo prefix from a local path by finding the first known root directory.
+
+    Examples:
+        /home/user/workspace/apps/my-app -> "apps/my-app"
+        /home/user/workspace/.bifrost     -> ".bifrost"
+        /home/user/workspace/             -> "" (workspace root, no prefix needed)
+    """
+    for i, part in enumerate(path.parts):
+        if part in KNOWN_ROOTS:
+            return "/".join(path.parts[i:])
+
+    # Workspace root — files already have correct relative paths
+    return ""
+
+
+def _find_bifrost_dir(local_root: pathlib.Path) -> pathlib.Path:
+    """Find the .bifrost/ manifest directory relative to a push root.
+
+    Resolution order:
+    1. If local_root IS the .bifrost/ directory, return it
+    2. Check local_root/.bifrost/
+    3. Walk up parent directories (max 10 levels) looking for .bifrost/
+    4. Fallback: return local_root/.bifrost/ (may not exist)
+    """
+    if local_root.name == ".bifrost":
+        return local_root
+
+    candidate = local_root / ".bifrost"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+
+    search = local_root.parent
+    for _ in range(10):
+        candidate = search / ".bifrost"
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        if search.parent == search:
+            break  # Hit filesystem root
+        search = search.parent
+
+    return local_root / ".bifrost"  # Fallback (may not exist)
+
+
+async def _push_with_precheck(
+    local_path: str,
+    clean: bool = False,
+    validate: bool = False,
+    watch: bool = False,
+    force: bool = False,
+    client: "BifrostClient | None" = None,
+) -> int:
+    """Push files with repo status pre-check and initial pull."""
+    if client is None:
+        try:
+            client = BifrostClient.get_instance(require_auth=True)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    # Check repo status (unless --force)
+    if not force:
+        if not await _check_repo_status(client):
+            return 1
+
+    # Pull at session start: sync server state to local before pushing
+    path = pathlib.Path(local_path).resolve()
+    if path.exists() and path.is_dir():
+        repo_prefix = _detect_repo_prefix(path)
+
+        if not await _pull_from_server(client, path, repo_prefix):
+            return 1
+
+    if watch:
+        return await _watch_and_push(local_path, clean=clean, validate=validate, client=client)
+    else:
+        return await _push_files(local_path, clean=clean, validate=validate, client=client)
+
+
+async def _do_push(
+    files: dict[str, str],
+    delete_missing_prefix: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    client: "BifrostClient | None" = None,
+) -> dict[str, Any] | None:
+    """Push a files dict to the API. Returns the response JSON or None on error."""
+    if client is None:
+        client = BifrostClient.get_instance(require_auth=True)
+    payload: dict[str, Any] = {"files": files}
+    if delete_missing_prefix:
+        payload["delete_missing_prefix"] = delete_missing_prefix
+
+    try:
+        response = await client.post(
+            "/api/files/push",
+            json=payload,
+            headers=extra_headers or {},
+        )
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Push failed: {response.status_code}", file=sys.stderr)
+            if response.text:
+                print(response.text, file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"Push error: {e}", file=sys.stderr)
+        return None
+
+
+async def _watch_and_push(
+    local_path: str,
+    clean: bool,
+    validate: bool,
+    client: "BifrostClient",
+) -> int:
+    """Watch directory for changes and auto-push."""
+    import pathlib
+    import threading
+
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    path = pathlib.Path(local_path).resolve()
+    if not path.exists() or not path.is_dir():
+        print(f"Error: {local_path} is not a valid directory", file=sys.stderr)
+        return 1
+
+    repo_prefix = _detect_repo_prefix(path)
+
+    # Notify server: watch started
+    try:
+        await client.post("/api/files/watch", json={
+            "action": "start", "prefix": repo_prefix,
+        })
+    except Exception:
+        pass  # Non-fatal
+
+    # Initial full push (reuses existing _push_files)
+    print(f"Initial push of {path}...", flush=True)
+    await _push_files(str(path), clean=clean, validate=validate, client=client)
+
+    # File change tracking
+    pending_changes: set[str] = set()
+    pending_deletes: set[str] = set()
+    lock = threading.Lock()
+    writeback_paused = False  # Pause watcher during server file writeback
+
+    class ChangeHandler(FileSystemEventHandler):
+        def _should_skip(self, file_path: str) -> bool:
+            """Check if a path should be ignored by the watcher."""
+            rel_parts = pathlib.Path(file_path).relative_to(path).parts
+            if any(p.startswith(".") and p != ".bifrost" for p in rel_parts):
+                return True
+            if any(p in ("__pycache__", "node_modules") for p in rel_parts):
+                return True
+            if pathlib.Path(file_path).suffix.lower() in BINARY_EXTENSIONS:
+                return True
+            return False
+
+        def on_any_event(self, event: FileSystemEvent) -> None:
+            if writeback_paused:
+                return
+            if event.is_directory:
+                return
+
+            # For moved/renamed events, track the destination as a change.
+            # Don't auto-delete the source — it may be a temp file that was
+            # never on the server (editors often write to .tmp then rename).
+            if event.event_type == "moved":
+                dest = str(getattr(event, "dest_path", ""))
+                if not dest or self._should_skip(dest):
+                    return
+                with lock:
+                    pending_changes.add(dest)
+                    pending_deletes.discard(dest)
+                return
+
+            src = str(event.src_path)
+            if self._should_skip(src):
+                return
+            with lock:
+                if event.event_type == "deleted":
+                    pending_deletes.add(src)
+                    pending_changes.discard(src)
+                elif event.event_type in ("created", "modified", "closed"):
+                    pending_changes.add(src)
+                    pending_deletes.discard(src)
+
+    observer = Observer()
+    observer.schedule(ChangeHandler(), str(path), recursive=True)
+    observer.start()
+
+    print(f"Watching {path} for changes... (Ctrl+C to stop)", flush=True)
+
+    heartbeat_interval = WATCH_HEARTBEAT_SECONDS
+    last_heartbeat = asyncio.get_event_loop().time()
+
+    consecutive_errors = 0
+
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+
+            # Observer health check — restart if thread died
+            if not observer.is_alive():
+                print("  ⚠ File watcher died, attempting restart...", flush=True)
+                try:
+                    observer = Observer()
+                    observer.schedule(ChangeHandler(), str(path), recursive=True)
+                    observer.start()
+                    print("  ✓ File watcher restarted", flush=True)
+                except Exception as e:
+                    print(f"  ✗ Could not restart file watcher: {e}", file=sys.stderr, flush=True)
+                    break
+
+            # Debounce: collect changes
+            with lock:
+                if pending_changes or pending_deletes:
+                    changes = pending_changes.copy()
+                    deletes = pending_deletes.copy()
+                    pending_changes.clear()
+                    pending_deletes.clear()
+                else:
+                    changes = set()
+                    deletes = set()
+
+            if changes or deletes:
+                try:
+                    # --- Sync deletions first (handles rename = delete + create) ---
+                    deleted_count = 0
+                    deleted_rels: list[str] = []
+                    for abs_path_str in deletes:
+                        abs_p = pathlib.Path(abs_path_str)
+                        if not abs_p.exists():  # Confirm actually deleted
+                            rel = abs_p.relative_to(path)
+                            # Skip .bifrost/ files — manifest is system-managed
+                            if str(rel).startswith(".bifrost/") or str(rel).startswith(".bifrost\\"):
+                                continue
+                            repo_path = f"{repo_prefix}/{rel}" if repo_prefix else str(rel)
+                            try:
+                                resp = await client.post("/api/files/delete", json={
+                                    "path": repo_path,
+                                    "location": "workspace",
+                                    "mode": "cloud",
+                                })
+                                if resp.status_code == 204:
+                                    deleted_count += 1
+                                    deleted_rels.append(str(rel))
+                            except Exception as del_err:
+                                # 404 = already gone, treat as success
+                                status_code = getattr(getattr(del_err, "response", None), "status_code", None)
+                                if status_code == 404:
+                                    deleted_count += 1
+                                    deleted_rels.append(str(rel))
+                                else:
+                                    ts = datetime.now().strftime('%H:%M:%S')
+                                    print(f"  [{ts}] Delete error for {rel}: {del_err}", flush=True)
+
+                    # --- Build files dict from changed paths ---
+                    push_files: dict[str, str] = {}
+                    for abs_path_str in changes:
+                        abs_p = pathlib.Path(abs_path_str)
+                        if abs_p.exists():
+                            try:
+                                content = abs_p.read_text(encoding="utf-8")
+                                rel = abs_p.relative_to(path)
+                                repo_path = f"{repo_prefix}/{rel}" if repo_prefix else str(rel)
+                                push_files[repo_path] = content
+                            except (UnicodeDecodeError, OSError):
+                                continue
+
+                    # Log actual trigger files (after filtering out temp/binary/missing)
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    for repo_path in sorted(push_files):
+                        print(f"  [{ts}] File changed: {repo_path}", flush=True)
+                    for rel_path in sorted(deleted_rels):
+                        print(f"  [{ts}] File deleted: {rel_path}", flush=True)
+
+                    if push_files:
+                        # Local manifest validation before push
+                        has_manifest = any(".bifrost/" in k for k in push_files)
+                        if has_manifest:
+                            val_errors = _validate_manifest_locally(path)
+                            if val_errors:
+                                print(f"  [{ts}] Manifest invalid, push skipped:", flush=True)
+                                for err in val_errors:
+                                    print(f"    - {err}", flush=True)
+                                # Re-queue so changes retry on next cycle
+                                with lock:
+                                    pending_changes.update(changes)
+                                    pending_deletes.update(deletes)
+                                continue
+
+                        result = await _do_push(
+                            push_files,
+                            extra_headers={"X-Bifrost-Watch": "true"},
+                            client=client,
+                        )
+                        if result:
+                            ts = datetime.now().strftime('%H:%M:%S')
+                            parts = []
+                            if result.get("created"):
+                                parts.append(f"{result['created']} created")
+                            if result.get("updated"):
+                                parts.append(f"{result['updated']} updated")
+                            if deleted_count:
+                                parts.append(f"{deleted_count} deleted")
+                            if result.get("unchanged"):
+                                parts.append(f"{result['unchanged']} unchanged")
+                            print(f"  [{ts}] Pushed \u2192 {', '.join(parts) if parts else 'no changes'}", flush=True)
+
+                            if result.get("errors"):
+                                for error in result["errors"]:
+                                    print(f"    Error: {error}", flush=True)
+                            if result.get("warnings"):
+                                for warning in result["warnings"]:
+                                    print(f"    Warning: {warning}", flush=True)
+
+                            # Write back server files (pause watcher to avoid re-trigger)
+                            if result.get("manifest_files") or result.get("modified_files"):
+                                writeback_paused = True
+                                writeback_paths: set[str] = set()
+                                try:
+                                    writeback_paths = _write_back_server_files(path, repo_prefix, result)
+                                finally:
+                                    # Brief sleep to let watcher drain queued events from writeback
+                                    await asyncio.sleep(0.2)
+                                    with lock:
+                                        # Only discard events caused by our writeback, not user edits
+                                        if writeback_paths:
+                                            pending_changes -= writeback_paths
+                                            pending_deletes -= writeback_paths
+                                    writeback_paused = False
+
+                    consecutive_errors = 0
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as batch_err:
+                    consecutive_errors += 1
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    print(f"  [{ts}] Push error: {batch_err}", flush=True)
+                    # Re-queue for retry
+                    with lock:
+                        pending_changes.update(changes)
+                        pending_deletes.update(deletes)
+                    if consecutive_errors >= 10:
+                        print(f"  [{ts}] ⚠ {consecutive_errors} consecutive errors, backing off to 5s", flush=True)
+                        await asyncio.sleep(5)
+
+            # Heartbeat
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat > heartbeat_interval:
+                try:
+                    await client.post("/api/files/watch", json={
+                        "action": "heartbeat", "prefix": repo_prefix,
+                    })
+                except Exception:
+                    pass
+                last_heartbeat = now
+
+    except KeyboardInterrupt:
+        pass  # Handled by handle_watch() caller
+    finally:
+        observer.stop()
+        observer.join()
+
+    return 0
+
+
+def _validate_manifest_locally(workspace_dir: "pathlib.Path") -> list[str]:
+    """Validate .bifrost/ manifest files locally before pushing.
+
+    Reads ALL manifest files from disk so cross-file references (e.g.
+    workflow → organization) are validated against the complete manifest,
+    not just the files that changed in this push batch.
+    """
+    from bifrost.manifest import parse_manifest_dir, validate_manifest, MANIFEST_FILES
+
+    bifrost_dir = workspace_dir / ".bifrost"
+    if not bifrost_dir.is_dir():
+        return []
+
+    yaml_files: dict[str, str] = {}
+    for filename in MANIFEST_FILES.values():
+        filepath = bifrost_dir / filename
+        if filepath.exists():
+            try:
+                yaml_files[filename] = filepath.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    if not yaml_files:
+        return []
+
+    try:
+        manifest = parse_manifest_dir(yaml_files)
+    except Exception as e:
+        return [f"Failed to parse manifest: {e}"]
+
+    return validate_manifest(manifest)
+
+
+def _write_back_server_files(
+    local_root: pathlib.Path,
+    repo_prefix: str,
+    result: dict[str, Any],
+) -> set[str]:
+    """Write manifest_files and modified_files from server response back to local disk.
+
+    Only writes files that actually differ from local content.
+    Returns set of absolute paths that were actually written (for watch mode event filtering).
+    """
+    written_paths: set[str] = set()
+
+    manifest_dir = _find_bifrost_dir(local_root)
+
+    # Write back regenerated .bifrost/ manifest files (only if changed)
+    for filename, content in result.get("manifest_files", {}).items():
+        local_path = manifest_dir / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        # Skip if local file already has identical content
+        if local_path.exists():
+            try:
+                if local_path.read_text(encoding="utf-8") == content:
+                    continue
+            except OSError:
+                pass
+        local_path.write_text(content, encoding="utf-8")
+        written_paths.add(str(local_path))
+
+    # Write back modified source files (e.g. forms/agents with resolved refs)
+    for repo_path, content in result.get("modified_files", {}).items():
+        if repo_prefix and repo_path.startswith(repo_prefix + "/"):
+            rel = repo_path[len(repo_prefix) + 1:]
+        elif repo_prefix and repo_path.startswith(repo_prefix):
+            rel = repo_path[len(repo_prefix):]
+        else:
+            rel = repo_path
+        local_path = local_root / rel
+        # Skip if local file already has identical content
+        if local_path.exists():
+            try:
+                if local_path.read_text(encoding="utf-8") == content:
+                    continue
+            except OSError:
+                pass
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(content, encoding="utf-8")
+        written_paths.add(str(local_path))
+
+    if written_paths:
+        print(f"  Wrote back {len(written_paths)} file(s) from server.")
+
+    return written_paths
+
+
+async def _pull_from_server(
+    client: BifrostClient,
+    local_root: pathlib.Path,
+    repo_prefix: str,
+) -> bool:
+    """Pull manifest files from server at session start. Returns True if successful."""
+
+    # Compute local manifest hashes
+    local_hashes: dict[str, str] = {}
+    bifrost_dir = _find_bifrost_dir(local_root)
+
+    if bifrost_dir.exists() and bifrost_dir.is_dir():
+        for bf in sorted(bifrost_dir.iterdir()):
+            if bf.is_file() and bf.suffix in (".yaml", ".yml"):
+                try:
+                    content = bf.read_bytes()
+                    local_hashes[f".bifrost/{bf.name}"] = hashlib.sha256(content).hexdigest()
+                except (OSError, UnicodeDecodeError):
+                    continue
+
+    # Call pull endpoint
+    try:
+        response = await client.post("/api/files/pull", json={
+            "prefix": repo_prefix,
+            "local_hashes": local_hashes,
+        })
+        if response.status_code != 200:
+            print(f"Warning: pull failed ({response.status_code})", file=sys.stderr)
+            return True
+
+        data = response.json()
+    except Exception as e:
+        print(f"Warning: pull failed: {e}", file=sys.stderr)
+        return True
+
+    manifest_files = data.get("manifest_files", {})
+
+    if not manifest_files:
+        return True
+
+    # Write manifest files — always authoritative from server
+    manifest_dir = bifrost_dir if bifrost_dir.exists() else local_root / ".bifrost"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for filename, content in manifest_files.items():
+        local_path = manifest_dir / filename
+        local_path.write_text(content, encoding="utf-8")
+        written += 1
+
+    print(f"  Updated {written} manifest file(s) from server.")
+    return True
+
+
+def _collect_push_files(
+    path: pathlib.Path,
+    repo_prefix: str,
+) -> tuple[dict[str, str], int]:
+    """Walk a directory and collect text files for push.
+
+    Returns (files_dict, skipped_count).
+    """
+    files: dict[str, str] = {}
+    skipped = 0
+
+    for file_path in sorted(path.rglob("*")):
+        if file_path.is_dir():
+            continue
+        rel_parts = file_path.relative_to(path).parts
+        if any(part.startswith(".") and part != ".bifrost" for part in rel_parts):
+            continue
+        if file_path.name in ("__pycache__", ".DS_Store", "node_modules"):
+            continue
+        if any(part == "__pycache__" or part == "node_modules" for part in rel_parts):
+            continue
+        if file_path.suffix.lower() in BINARY_EXTENSIONS:
+            skipped += 1
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            rel = file_path.relative_to(path)
+            repo_path = f"{repo_prefix}/{rel}" if repo_prefix else str(rel)
+            files[repo_path] = content
+        except UnicodeDecodeError:
+            skipped += 1
+            continue
+
+    return files, skipped
+
+
+def _print_push_summary(result: dict[str, Any]) -> None:
+    """Print push result summary."""
+    summary_parts = []
+    if result.get("created"):
+        summary_parts.append(f"{result['created']} created")
+    if result.get("updated"):
+        summary_parts.append(f"{result['updated']} updated")
+    if result.get("deleted"):
+        summary_parts.append(f"{result['deleted']} deleted")
+    if result.get("unchanged"):
+        summary_parts.append(f"{result['unchanged']} unchanged")
+    print(f"  {', '.join(summary_parts) if summary_parts else 'No changes'}")
+
+    if result.get("errors"):
+        print(f"\n  Errors ({len(result['errors'])}):")
+        for error in result["errors"]:
+            print(f"    - {error}")
+
+    if result.get("warnings"):
+        print(f"\n  Warnings ({len(result['warnings'])}):")
+        for warning in result["warnings"]:
+            print(f"    - {warning}")
+
+
+async def _push_files(local_path: str, clean: bool = False, validate: bool = False, client: "BifrostClient | None" = None) -> int:
     """Push local directory to Bifrost _repo/."""
     import pathlib
 
@@ -847,151 +1570,170 @@ async def _push_files(local_path: str, clean: bool = False, validate: bool = Fal
         print(f"Error: path is not a directory: {local_path}", file=sys.stderr)
         return 1
 
-    # Determine repo prefix from path structure
-    # Look for known top-level dirs (apps, workflows, modules, agents, forms) in the path
-    # e.g., "/home/user/workspace/apps/my-app" -> "apps/my-app"
-    # e.g., "/home/user/workspace/workflows" -> "workflows"
-    parts = path.parts
-    repo_prefix = None
-    known_roots = {"apps", "workflows", "modules", "agents", "forms"}
-    for i, part in enumerate(parts):
-        if part in known_roots:
-            repo_prefix = "/".join(parts[i:])
-            break
-
-    if repo_prefix is None:
-        # Fallback: use the directory name itself
-        repo_prefix = path.name
-        print(f"Warning: could not detect repo prefix from path. Using '{repo_prefix}'.", file=sys.stderr)
-        print("  Hint: path should contain apps/, workflows/, modules/, etc.", file=sys.stderr)
+    repo_prefix = _detect_repo_prefix(path)
 
     # Walk the directory and collect files
-    files: dict[str, str] = {}
-    skipped = 0
-
-    # Binary file extensions to skip
-    binary_extensions = {
-        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
-        ".woff", ".woff2", ".ttf", ".eot",
-        ".zip", ".tar", ".gz", ".bz2",
-        ".pyc", ".pyo", ".so", ".dll",
-        ".exe", ".bin",
-    }
-
-    for file_path in sorted(path.rglob("*")):
-        if file_path.is_dir():
-            continue
-
-        # Skip hidden files and common non-content files
-        rel_parts = file_path.relative_to(path).parts
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if file_path.name in ("__pycache__", ".DS_Store", "node_modules"):
-            continue
-        if any(part == "__pycache__" or part == "node_modules" for part in rel_parts):
-            continue
-
-        # Skip binary files
-        if file_path.suffix.lower() in binary_extensions:
-            skipped += 1
-            continue
-
-        try:
-            content = file_path.read_text(encoding="utf-8")
-            repo_path = f"{repo_prefix}/{file_path.relative_to(path)}"
-            files[repo_path] = content
-        except UnicodeDecodeError:
-            skipped += 1
-            continue
+    files, skipped = _collect_push_files(path, repo_prefix)
 
     if not files:
         print("No files found to push.", file=sys.stderr)
         return 1
 
-    print(f"Pushing {len(files)} file(s) to {repo_prefix}/...")
+    # Local manifest validation before push
+    has_manifest = any(".bifrost/" in k or ".bifrost\\" in k for k in files)
+    if has_manifest:
+        validation_errors = _validate_manifest_locally(path)
+        if validation_errors:
+            print("Manifest validation errors (push skipped):", file=sys.stderr)
+            for err in validation_errors:
+                print(f"  - {err}", file=sys.stderr)
+            return 1
+
+    if repo_prefix:
+        print(f"Scanning {len(files)} file(s) in {repo_prefix}/...")
+    else:
+        print(f"Scanning {len(files)} file(s)...")
     if skipped:
         print(f"  (skipped {skipped} binary file(s))")
 
-    # Get authenticated client
+    # Push files via _do_push helper
+    delete_prefix = repo_prefix if clean else None
+    result = await _do_push(files, delete_missing_prefix=delete_prefix, client=client)
+
+    if result is None:
+        return 1
+
+    # Print summary
+    _print_push_summary(result)
+
+    # Write back manifest files and modified files from server response
+    if result.get("manifest_files") or result.get("modified_files"):
+        _write_back_server_files(path, repo_prefix, result)
+
+    if result.get("manifest_applied"):
+        print("  Manifest applied to platform.")
+
+    # Validate if requested
+    if validate and repo_prefix.startswith("apps/"):
+        slug = repo_prefix.split("/")[1] if "/" in repo_prefix else repo_prefix
+        print(f"\nValidating app '{slug}'...")
+
+        try:
+            if client is None:
+                client = BifrostClient.get_instance(require_auth=True)
+            # Look up app by slug
+            val_response = await client.get(f"/api/applications/{slug}")
+            if val_response.status_code == 200:
+                app_data = val_response.json()
+                app_id = app_data.get("id")
+                if app_id:
+                    val_result = await client.post(f"/api/applications/{app_id}/validate")
+                    if val_result.status_code == 200:
+                        val_data = val_result.json()
+                        if val_data.get("errors"):
+                            print(f"  Errors ({len(val_data['errors'])}):")
+                            for err in val_data["errors"]:
+                                print(f"    - [{err.get('severity', 'error')}] {err.get('message', err)}")
+                        elif val_data.get("warnings"):
+                            print(f"  Warnings ({len(val_data['warnings'])}):")
+                            for warn in val_data["warnings"]:
+                                print(f"    - {warn.get('message', warn)}")
+                        else:
+                            print("  No issues found.")
+                    else:
+                        print(f"  Validation failed: {val_result.status_code}", file=sys.stderr)
+            else:
+                print(f"  Could not find app '{slug}' for validation", file=sys.stderr)
+        except Exception as e:
+            print(f"  Validation error: {e}", file=sys.stderr)
+
+    return 0 if not result.get("errors") else 1
+
+
+def handle_api(args: list[str]) -> int:
+    """bifrost api <METHOD> <endpoint> [json-body]"""
+    if not args or args[0] in ("--help", "-h"):
+        print("""
+Usage: bifrost api <METHOD> <endpoint> [json-body]
+
+Make an authenticated API request to Bifrost.
+
+Arguments:
+  METHOD                HTTP method (GET, POST, PUT, PATCH, DELETE)
+  endpoint              API endpoint path (e.g., /api/workflows)
+  json-body             Optional JSON body (inline or @filename)
+
+Examples:
+  bifrost api GET /api/workflows
+  bifrost api GET /api/github/repo-status
+  bifrost api POST /api/applications/my-app/validate
+  bifrost api POST /api/files/push @payload.json
+""".strip())
+        return 0 if args and args[0] in ("--help", "-h") else 1
+
+    if len(args) < 2:
+        print("Usage: bifrost api <METHOD> <endpoint> [json-body]", file=sys.stderr)
+        return 1
+
+    method = args[0].upper()
+    endpoint = args[1]
+    body = None
+
+    if len(args) > 2:
+        import pathlib
+        raw = args[2]
+        # Support @filename for reading body from file
+        if raw.startswith("@"):
+            try:
+                body = json.loads(pathlib.Path(raw[1:]).read_text())
+            except Exception as e:
+                print(f"Error reading file: {e}", file=sys.stderr)
+                return 1
+        else:
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"Invalid JSON: {e}", file=sys.stderr)
+                return 1
+
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        print(f"Unsupported method: {method}", file=sys.stderr)
+        return 1
+
+    # Authenticate BEFORE entering asyncio.run() so token refresh works
     try:
         client = BifrostClient.get_instance(require_auth=True)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Push files
-    payload: dict[str, Any] = {"files": files}
-    if clean:
-        payload["delete_missing_prefix"] = repo_prefix
+    return asyncio.run(_api_request(method, endpoint, body, client=client))
 
-    try:
-        response = await client.post("/api/files/push", json=payload)
 
-        if response.status_code != 200:
-            print(f"Error: server returned {response.status_code}", file=sys.stderr)
-            try:
-                detail = response.json().get("detail", response.text)
-                print(f"  {detail}", file=sys.stderr)
-            except Exception:
-                print(f"  {response.text}", file=sys.stderr)
+async def _api_request(method: str, endpoint: str, body: Any | None, client: "BifrostClient | None" = None) -> int:
+    if client is None:
+        try:
+            client = BifrostClient.get_instance(require_auth=True)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
             return 1
 
-        result = response.json()
+    http_fn = getattr(client, method.lower())
+    kwargs: dict[str, Any] = {}
+    if body is not None:
+        kwargs["json"] = body
 
-        # Print summary
-        parts = []
-        if result.get("created"):
-            parts.append(f"{result['created']} created")
-        if result.get("updated"):
-            parts.append(f"{result['updated']} updated")
-        if result.get("deleted"):
-            parts.append(f"{result['deleted']} deleted")
-        if result.get("unchanged"):
-            parts.append(f"{result['unchanged']} unchanged")
-
-        print(f"  {', '.join(parts) if parts else 'No changes'}")
-
-        if result.get("errors"):
-            print(f"\n  Errors ({len(result['errors'])}):")
-            for error in result["errors"]:
-                print(f"    - {error}")
-
-        # Validate if requested
-        if validate and repo_prefix.startswith("apps/"):
-            slug = repo_prefix.split("/")[1] if "/" in repo_prefix else repo_prefix
-            print(f"\nValidating app '{slug}'...")
-
-            try:
-                # Look up app by slug
-                val_response = await client.get(f"/api/applications/{slug}")
-                if val_response.status_code == 200:
-                    app_data = val_response.json()
-                    app_id = app_data.get("id")
-                    if app_id:
-                        val_result = await client.post(f"/api/applications/{app_id}/validate")
-                        if val_result.status_code == 200:
-                            val_data = val_result.json()
-                            if val_data.get("errors"):
-                                print(f"  Errors ({len(val_data['errors'])}):")
-                                for err in val_data["errors"]:
-                                    print(f"    - [{err.get('severity', 'error')}] {err.get('message', err)}")
-                            elif val_data.get("warnings"):
-                                print(f"  Warnings ({len(val_data['warnings'])}):")
-                                for warn in val_data["warnings"]:
-                                    print(f"    - {warn.get('message', warn)}")
-                            else:
-                                print("  No issues found.")
-                        else:
-                            print(f"  Validation failed: {val_result.status_code}", file=sys.stderr)
-                else:
-                    print(f"  Could not find app '{slug}' for validation", file=sys.stderr)
-            except Exception as e:
-                print(f"  Validation error: {e}", file=sys.stderr)
-
-        return 0 if not result.get("errors") else 1
-
+    try:
+        response = await http_fn(endpoint, **kwargs)
+        # Pretty-print response
+        try:
+            data = response.json()
+            print(json.dumps(data, indent=2, default=str))
+        except Exception:
+            print(response.text)
+        return 0 if response.status_code < 400 else 1
     except httpx.ConnectError:
-        print("Error: could not connect to Bifrost API. Is the server running?", file=sys.stderr)
+        print("Error: could not connect to Bifrost API.", file=sys.stderr)
         return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

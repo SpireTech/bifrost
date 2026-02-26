@@ -173,6 +173,7 @@ class OrgScopedRepository(Generic[ModelT]):
 
         if entity and (self.is_superuser or await self._can_access_entity(entity)):
             return entity
+
         return None
 
     async def can_access(self, **filters: Any) -> ModelT:

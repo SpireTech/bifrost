@@ -2271,6 +2271,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/files/signed-url": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Get Signed Url
+         * @description Generate a presigned S3 URL for direct file upload or download.
+         */
+        post: operations["get_signed_url_api_files_signed_url_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/files/push": {
         parameters: {
             query?: never;
@@ -2290,6 +2310,89 @@ export interface paths {
          *     that are not in the push batch.
          */
         post: operations["push_files_api_files_push_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/pull": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pull Files
+         * @description Pull manifest files from server that differ from local state.
+         *
+         *     Only returns regenerated .bifrost/*.yaml from DB state.
+         *     Code file reconciliation is handled by git, not by this endpoint.
+         */
+        post: operations["pull_files_api_files_pull_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Manifest
+         * @description Return regenerated manifest files from DB state.
+         */
+        get: operations["get_manifest_api_files_manifest_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/watch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manage Watch Session
+         * @description Register, heartbeat, or deregister a CLI watch session.
+         */
+        post: operations["manage_watch_session_api_files_watch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/watchers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Active Watchers
+         * @description List active CLI watch sessions.
+         */
+        get: operations["list_active_watchers_api_files_watchers_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2769,6 +2872,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/github/repo-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fast repo status for CLI push pre-check
+         * @description Check if platform has uncommitted changes and if git is configured
+         */
+        get: operations["get_repo_status_api_github_repo_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/github/validate": {
         parameters: {
             query?: never;
@@ -2949,7 +3072,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/github/pull": {
+    "/api/github/sync": {
         parameters: {
             query?: never;
             header?: never;
@@ -2959,17 +3082,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Queue git pull
-         * @description Queue a git pull operation.
+         * Queue sync (pull + push)
+         * @description Queue a combined sync: pull remote changes, push local commits, import entities. Results via WebSocket.
          */
-        post: operations["git_pull_api_github_pull_post"];
+        post: operations["git_sync_api_github_sync_post"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/github/push": {
+    "/api/github/abort-merge": {
         parameters: {
             query?: never;
             header?: never;
@@ -2979,10 +3102,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Queue git push
-         * @description Queue a git push operation.
+         * Abort merge
+         * @description Abort an in-progress merge, returning to pre-pull state.
          */
-        post: operations["git_push_api_github_push_post"];
+        post: operations["git_abort_merge_api_github_abort_merge_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3063,30 +3186,6 @@ export interface paths {
          * @description Discard uncommitted changes for specific files (git checkout -- <path>).
          */
         post: operations["git_discard_api_github_discard_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/github/sync": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Queue sync preview
-         * @description Queue a sync preview operation. Fetches remote, computes diff, runs preflight. Results via WebSocket/polling.
-         */
-        get: operations["sync_preview_api_github_sync_get"];
-        put?: never;
-        /**
-         * Queue sync execution
-         * @description Queue a full sync: commit local changes, pull remote (with conflict resolutions), push. Results via WebSocket/polling.
-         */
-        post: operations["sync_execute_api_github_sync_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3316,22 +3415,22 @@ export interface paths {
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        get: operations["execute_endpoint_api_endpoints__workflow_id__get"];
+        get: operations["execute_endpoint_api_endpoints__workflow_id__post"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        put: operations["execute_endpoint_api_endpoints__workflow_id__get"];
+        put: operations["execute_endpoint_api_endpoints__workflow_id__post"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        post: operations["execute_endpoint_api_endpoints__workflow_id__get"];
+        post: operations["execute_endpoint_api_endpoints__workflow_id__post"];
         /**
          * Execute workflow via API key
          * @description Execute an endpoint-enabled workflow using an API key for authentication
          */
-        delete: operations["execute_endpoint_api_endpoints__workflow_id__get"];
+        delete: operations["execute_endpoint_api_endpoints__workflow_id__post"];
         options?: never;
         head?: never;
         patch?: never;
@@ -4068,6 +4167,75 @@ export interface paths {
          * @description Delete a document via SDK.
          */
         post: operations["cli_delete_document_api_cli_tables_documents_delete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cli/tables/documents/insert/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Batch insert documents
+         * @description Batch insert documents into a table via SDK.
+         *
+         *     Auto-creates the table if it doesn't exist.
+         *     All documents are inserted atomically — if any ID conflicts, the entire batch rolls back.
+         */
+        post: operations["cli_insert_documents_batch_api_cli_tables_documents_insert_batch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cli/tables/documents/upsert/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Batch upsert documents
+         * @description Batch upsert (create or replace) documents via SDK.
+         *
+         *     Auto-creates the table if it doesn't exist.
+         *     Uses atomic INSERT ... ON CONFLICT DO UPDATE for each document.
+         */
+        post: operations["cli_upsert_documents_batch_api_cli_tables_documents_upsert_batch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cli/tables/documents/delete/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Batch delete documents
+         * @description Batch delete documents via SDK.
+         *
+         *     Returns the IDs of documents that were actually deleted.
+         *     Non-existent IDs are silently skipped.
+         */
+        post: operations["cli_delete_documents_batch_api_cli_tables_documents_delete_batch_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5420,6 +5588,28 @@ export interface paths {
          *     Requires platform admin access.
          */
         post: operations["validate_email_workflow_api_admin_email_validate__workflow_id__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/email/send": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send Email Sdk
+         * @description Send an email via the configured email workflow.
+         *
+         *     Used by SDK's email.send() method. Requires superuser auth (workflow engine token).
+         */
+        post: operations["send_email_sdk_api_email_send_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6927,6 +7117,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/llms.txt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Llms Txt
+         * @description Return the full platform documentation as a single markdown document.
+         */
+        get: operations["get_llms_txt_api_llms_txt_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/platform/workers/config": {
         parameters: {
             query?: never;
@@ -7668,6 +7878,13 @@ export interface components {
              * @description npm dependencies {name: version} for esm.sh loading
              */
             dependencies?: {
+                [key: string]: string;
+            };
+            /**
+             * Styles
+             * @description CSS files {path: content} for style injection
+             */
+            styles?: {
                 [key: string]: string;
             };
         };
@@ -8887,6 +9104,11 @@ export interface components {
          */
         CommitRequest: {
             /**
+             * Job Id
+             * @description Client-generated job ID (avoids WebSocket race condition)
+             */
+            job_id?: string | null;
+            /**
              * Message
              * @description Commit message
              */
@@ -9688,6 +9910,11 @@ export interface components {
          */
         DiffRequest: {
             /**
+             * Job Id
+             * @description Client-generated job ID (avoids WebSocket race condition)
+             */
+            job_id?: string | null;
+            /**
              * Path
              * @description File path to diff
              */
@@ -9698,6 +9925,11 @@ export interface components {
          * @description Request to discard working tree changes for specific files.
          */
         DiscardRequest: {
+            /**
+             * Job Id
+             * @description Client-generated job ID (avoids WebSocket race condition)
+             */
+            job_id?: string | null;
             /**
              * Paths
              * @description File paths to discard changes for
@@ -9904,6 +10136,49 @@ export interface components {
             items: {
                 [key: string]: unknown;
             }[];
+        };
+        /**
+         * EmailSendRequest
+         * @description Request to send an email via SDK.
+         */
+        EmailSendRequest: {
+            /**
+             * Recipient
+             * @description Recipient email address
+             */
+            recipient: string;
+            /**
+             * Subject
+             * @description Email subject
+             */
+            subject: string;
+            /**
+             * Body
+             * @description Plain text body
+             */
+            body: string;
+            /**
+             * Html Body
+             * @description Optional HTML body
+             */
+            html_body?: string | null;
+            /**
+             * Scope
+             * @description Organization scope for config resolution
+             */
+            scope?: string | null;
+        };
+        /**
+         * EmailSendResponse
+         * @description Response from email send.
+         */
+        EmailSendResponse: {
+            /** Success */
+            success: boolean;
+            /** Execution Id */
+            execution_id?: string | null;
+            /** Error */
+            error?: string | null;
         };
         /**
          * EmailWorkflowConfigRequest
@@ -11024,6 +11299,49 @@ export interface components {
          */
         FileMode: "draft" | "live";
         /**
+         * FilePullRequest
+         * @description Request to pull files from server.
+         */
+        FilePullRequest: {
+            /**
+             * Prefix
+             * @description Repo prefix to pull from
+             */
+            prefix: string;
+            /**
+             * Local Hashes
+             * @description Map of path to sha256 hash
+             */
+            local_hashes?: {
+                [key: string]: string;
+            };
+        };
+        /**
+         * FilePullResponse
+         * @description Response for file pull.
+         */
+        FilePullResponse: {
+            /**
+             * Files
+             * @description Map of path to content for changed files
+             */
+            files?: {
+                [key: string]: string;
+            };
+            /**
+             * Deleted
+             * @description Paths that exist locally but not on server
+             */
+            deleted?: string[];
+            /**
+             * Manifest Files
+             * @description Regenerated .bifrost/*.yaml
+             */
+            manifest_files?: {
+                [key: string]: string;
+            };
+        };
+        /**
          * FilePushRequest
          * @description Request to push multiple files to _repo/.
          */
@@ -11068,6 +11386,21 @@ export interface components {
             unchanged: number;
             /** Errors */
             errors?: string[];
+            /** Warnings */
+            warnings?: string[];
+            /**
+             * Manifest Applied
+             * @default false
+             */
+            manifest_applied: boolean;
+            /** Manifest Files */
+            manifest_files?: {
+                [key: string]: string;
+            };
+            /** Modified Files */
+            modified_files?: {
+                [key: string]: string;
+            };
         };
         /**
          * FileReadRequest
@@ -11774,6 +12107,17 @@ export interface components {
              * @default queued
              */
             status: string;
+        };
+        /**
+         * GitOpRequest
+         * @description Base request for git operations. Accepts optional client-generated job_id.
+         */
+        GitOpRequest: {
+            /**
+             * Job Id
+             * @description Client-generated job ID (avoids WebSocket race condition)
+             */
+            job_id?: string | null;
         };
         /**
          * GitRefreshStatusResponse
@@ -15193,6 +15537,11 @@ export interface components {
              * @description Name of the decorated function to register
              */
             function_name: string;
+            /**
+             * Organization Id
+             * @description Organization ID to scope the workflow to, or null for global scope
+             */
+            organization_id?: string | null;
         };
         /**
          * RegisterWorkflowResponse
@@ -15229,6 +15578,11 @@ export interface components {
              * @description Workflow description
              */
             description?: string | null;
+            /**
+             * Organization Id
+             * @description Organization ID if org-scoped, null for global
+             */
+            organization_id?: string | null;
         };
         /**
          * ReimportJobResponse
@@ -15300,10 +15654,36 @@ export interface components {
             new_path: string;
         };
         /**
+         * RepoStatusResponse
+         * @description Fast repo status check for CLI push pre-check.
+         */
+        RepoStatusResponse: {
+            /**
+             * Git Configured
+             * @description Whether GitHub integration is configured
+             */
+            git_configured: boolean;
+            /**
+             * Dirty
+             * @description Whether platform has uncommitted changes
+             */
+            dirty: boolean;
+            /**
+             * Dirty Since
+             * @description ISO timestamp when repo became dirty
+             */
+            dirty_since?: string | null;
+        };
+        /**
          * ResolveRequest
          * @description Request to resolve merge conflicts after a failed pull.
          */
         ResolveRequest: {
+            /**
+             * Job Id
+             * @description Client-generated job ID (avoids WebSocket race condition)
+             */
+            job_id?: string | null;
             /**
              * Resolutions
              * @description Map of file path to resolution strategy
@@ -15507,6 +15887,38 @@ export interface components {
             user_ids: string[];
         };
         /**
+         * SDKBatchDeleteResponse
+         * @description Batch delete response.
+         */
+        SDKBatchDeleteResponse: {
+            /**
+             * Deleted Ids
+             * @description IDs of deleted documents
+             */
+            deleted_ids: string[];
+            /**
+             * Count
+             * @description Number of documents deleted
+             */
+            count: number;
+        };
+        /**
+         * SDKBatchDocumentResponse
+         * @description Batch insert/upsert response.
+         */
+        SDKBatchDocumentResponse: {
+            /**
+             * Documents
+             * @description Created/updated documents
+             */
+            documents: components["schemas"]["SDKDocumentData"][];
+            /**
+             * Count
+             * @description Number of documents affected
+             */
+            count: number;
+        };
+        /**
          * SDKDocumentCountRequest
          * @description SDK request for counting documents.
          */
@@ -15568,6 +15980,32 @@ export interface components {
             updated_at: string;
         };
         /**
+         * SDKDocumentDeleteBatchRequest
+         * @description SDK request for batch deleting documents.
+         */
+        SDKDocumentDeleteBatchRequest: {
+            /**
+             * Table
+             * @description Table name
+             */
+            table: string;
+            /**
+             * Doc Ids
+             * @description Document IDs to delete (max 1000)
+             */
+            doc_ids: string[];
+            /**
+             * Scope
+             * @description Organization scope
+             */
+            scope?: string | null;
+            /**
+             * App
+             * @description Application UUID
+             */
+            app?: string | null;
+        };
+        /**
          * SDKDocumentDeleteRequest
          * @description SDK request for deleting a document.
          */
@@ -15608,6 +16046,50 @@ export interface components {
              * @description Document UUID
              */
             doc_id: string;
+            /**
+             * Scope
+             * @description Organization scope
+             */
+            scope?: string | null;
+            /**
+             * App
+             * @description Application UUID
+             */
+            app?: string | null;
+        };
+        /**
+         * SDKDocumentInsertBatchItem
+         * @description Single item in a batch insert request.
+         */
+        SDKDocumentInsertBatchItem: {
+            /**
+             * Id
+             * @description Document ID (optional, auto-generated if not provided)
+             */
+            id?: string | null;
+            /**
+             * Data
+             * @description Document data
+             */
+            data: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * SDKDocumentInsertBatchRequest
+         * @description SDK request for batch inserting documents.
+         */
+        SDKDocumentInsertBatchRequest: {
+            /**
+             * Table
+             * @description Table name
+             */
+            table: string;
+            /**
+             * Documents
+             * @description Documents to insert (max 1000)
+             */
+            documents: components["schemas"]["SDKDocumentInsertBatchItem"][];
             /**
              * Scope
              * @description Organization scope
@@ -15777,6 +16259,50 @@ export interface components {
             app?: string | null;
         };
         /**
+         * SDKDocumentUpsertBatchItem
+         * @description Single item in a batch upsert request.
+         */
+        SDKDocumentUpsertBatchItem: {
+            /**
+             * Id
+             * @description Document ID (required for upsert)
+             */
+            id: string;
+            /**
+             * Data
+             * @description Document data
+             */
+            data: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * SDKDocumentUpsertBatchRequest
+         * @description SDK request for batch upserting documents.
+         */
+        SDKDocumentUpsertBatchRequest: {
+            /**
+             * Table
+             * @description Table name
+             */
+            table: string;
+            /**
+             * Documents
+             * @description Documents to upsert (max 1000)
+             */
+            documents: components["schemas"]["SDKDocumentUpsertBatchItem"][];
+            /**
+             * Scope
+             * @description Organization scope
+             */
+            scope?: string | null;
+            /**
+             * App
+             * @description Application UUID
+             */
+            app?: string | null;
+        };
+        /**
          * SDKDocumentUpsertRequest
          * @description SDK request for upserting (create or replace) a document.
          */
@@ -15896,6 +16422,11 @@ export interface components {
             };
             /** @description Full OAuth credentials and configuration */
             oauth?: components["schemas"]["SDKIntegrationsOAuthData"] | null;
+            /**
+             * Config Secret Keys
+             * @description Config keys that contain secret values (for log masking)
+             */
+            config_secret_keys?: string[];
         };
         /**
          * SDKIntegrationsListMappingsRequest
@@ -16423,6 +16954,57 @@ export interface components {
             token_type: string;
         };
         /**
+         * SignedUrlRequest
+         * @description Request to generate a presigned S3 URL.
+         */
+        SignedUrlRequest: {
+            /**
+             * Path
+             * @description File path (scoped automatically by org)
+             */
+            path: string;
+            /**
+             * Method
+             * @description HTTP method: PUT for upload, GET for download
+             * @default PUT
+             * @enum {string}
+             */
+            method: "PUT" | "GET";
+            /**
+             * Content Type
+             * @description MIME type (only used for PUT)
+             * @default application/octet-stream
+             */
+            content_type: string;
+            /**
+             * Scope
+             * @description Organization scope (auto-resolved from context if None)
+             */
+            scope?: string | null;
+        };
+        /**
+         * SignedUrlResponse
+         * @description Response with presigned URL.
+         */
+        SignedUrlResponse: {
+            /**
+             * Url
+             * @description Presigned S3 URL
+             */
+            url: string;
+            /**
+             * Path
+             * @description Full S3 path
+             */
+            path: string;
+            /**
+             * Expires In
+             * @description URL expiration in seconds
+             * @default 600
+             */
+            expires_in: number;
+        };
+        /**
          * SimpleFileListResponse
          * @description Response for listing S3-backed app files.
          */
@@ -16495,21 +17077,6 @@ export interface components {
              * Format: date-time
              */
             last_stuck_at: string;
-        };
-        /**
-         * SyncExecuteRequest
-         * @description Request to execute a sync with conflict resolutions.
-         */
-        SyncExecuteRequest: {
-            /** Conflict Resolutions */
-            conflict_resolutions?: {
-                [key: string]: string;
-            };
-            /**
-             * Confirm Orphans
-             * @default false
-             */
-            confirm_orphans: boolean;
         };
         /**
          * SystemLog
@@ -17238,6 +17805,19 @@ export interface components {
             severity: "error" | "warning";
         };
         /**
+         * WatchSessionRequest
+         * @description Request to manage a CLI watch session.
+         */
+        WatchSessionRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "start" | "stop" | "heartbeat";
+            /** Prefix */
+            prefix: string;
+        };
+        /**
          * WebhookAdapterInfo
          * @description Information about an available webhook adapter.
          */
@@ -17441,6 +18021,11 @@ export interface components {
              * @default false
              */
             transient: boolean;
+            /**
+             * Sync
+             * @description If true, block until execution completes and return result inline. Overrides workflow's execution_mode setting.
+             */
+            sync?: boolean | null;
             /**
              * Code
              * @description Optional: Python code to execute as script (base64 encoded). If provided, executes code instead of looking up workflow by ID.
@@ -21734,6 +22319,39 @@ export interface operations {
             };
         };
     };
+    get_signed_url_api_files_signed_url_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SignedUrlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignedUrlResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     push_files_api_files_push_post: {
         parameters: {
             query?: never;
@@ -21763,6 +22381,118 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    pull_files_api_files_pull_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FilePullRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FilePullResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_manifest_api_files_manifest_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    manage_watch_session_api_files_watch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_active_watchers_api_files_watchers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
         };
@@ -22524,6 +23254,26 @@ export interface operations {
             };
         };
     };
+    get_repo_status_api_github_repo_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoStatusResponse"];
+                };
+            };
+        };
+    };
     validate_github_token_api_github_validate_post: {
         parameters: {
             query?: never;
@@ -22738,7 +23488,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GitOpRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -22747,6 +23501,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GitJobResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -22784,14 +23547,18 @@ export interface operations {
             };
         };
     };
-    git_pull_api_github_pull_post: {
+    git_sync_api_github_sync_post: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GitOpRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -22802,16 +23569,29 @@ export interface operations {
                     "application/json": components["schemas"]["GitJobResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
-    git_push_api_github_push_post: {
+    git_abort_merge_api_github_abort_merge_post: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GitOpRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -22820,6 +23600,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GitJobResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -22831,7 +23620,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GitOpRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -22840,6 +23633,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GitJobResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -22920,59 +23722,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["DiscardRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GitJobResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    sync_preview_api_github_sync_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GitJobResponse"];
-                };
-            };
-        };
-    };
-    sync_execute_api_github_sync_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SyncExecuteRequest"];
             };
         };
         responses: {
@@ -23379,7 +24128,7 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_id__get: {
+    execute_endpoint_api_endpoints__workflow_id__post: {
         parameters: {
             query?: never;
             header: {
@@ -23412,7 +24161,7 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_id__get: {
+    execute_endpoint_api_endpoints__workflow_id__post: {
         parameters: {
             query?: never;
             header: {
@@ -23445,7 +24194,7 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_id__get: {
+    execute_endpoint_api_endpoints__workflow_id__post: {
         parameters: {
             query?: never;
             header: {
@@ -23478,7 +24227,7 @@ export interface operations {
             };
         };
     };
-    execute_endpoint_api_endpoints__workflow_id__get: {
+    execute_endpoint_api_endpoints__workflow_id__post: {
         parameters: {
             query?: never;
             header: {
@@ -24712,6 +25461,105 @@ export interface operations {
                 };
                 content: {
                     "application/json": boolean;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cli_insert_documents_batch_api_cli_tables_documents_insert_batch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SDKDocumentInsertBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SDKBatchDocumentResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cli_upsert_documents_batch_api_cli_tables_documents_upsert_batch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SDKDocumentUpsertBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SDKBatchDocumentResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cli_delete_documents_batch_api_cli_tables_documents_delete_batch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SDKDocumentDeleteBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SDKBatchDeleteResponse"];
                 };
             };
             /** @description Validation Error */
@@ -27227,6 +28075,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EmailWorkflowValidationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    send_email_sdk_api_email_send_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailSendRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailSendResponse"];
                 };
             };
             /** @description Validation Error */
@@ -30257,6 +31138,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_llms_txt_api_llms_txt_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
                 };
             };
         };

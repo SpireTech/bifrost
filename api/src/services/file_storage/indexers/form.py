@@ -44,7 +44,8 @@ def _serialize_form_to_yaml(form: Form) -> bytes:
         exclude={"organization_id", "access_level", "created_at", "updated_at"},
     )
 
-    return yaml.dump(form_data, default_flow_style=False, sort_keys=False).encode("utf-8")
+    content = yaml.dump(form_data, default_flow_style=False, sort_keys=False)
+    return (content.rstrip() + "\n").encode("utf-8")
 
 
 class FormIndexer:
@@ -257,6 +258,7 @@ class FormIndexer:
                     multiple=form_field.multiple,
                     max_size_mb=form_field.max_size_mb,
                     content=form_field.content,
+                    allow_as_query_param=form_field.allow_as_query_param,
                 )
                 self.db.add(field_orm)
 

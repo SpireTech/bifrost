@@ -29,9 +29,10 @@ from src.models import (
     GitHubReposResponse,
     GitHubSetupResponse,
     GitJobResponse,
+    GitOpRequest,
     GitRefreshStatusResponse,
+    RepoStatusResponse,
     ResolveRequest,
-    SyncExecuteRequest,
     ValidateTokenRequest,
 )
 from src.services.github_api import GitHubAPIClient, GitHubAPIError
@@ -189,6 +190,29 @@ async def get_github_status(
             last_synced=None,
             error=str(e),
         )
+
+
+@router.get(
+    "/repo-status",
+    response_model=RepoStatusResponse,
+    summary="Fast repo status for CLI push pre-check",
+    description="Check if platform has uncommitted changes and if git is configured",
+)
+async def get_repo_status(
+    ctx: Context,
+    user: CurrentSuperuser,
+    db: DbSession,
+) -> RepoStatusResponse:
+    """Fast repo status check used by CLI push to gate on dirty state."""
+    from src.core.repo_dirty import get_repo_dirty_since
+
+    config = await get_github_config(db, ctx.org_id)
+    dirty_since = await get_repo_dirty_since()
+    return RepoStatusResponse(
+        git_configured=config is not None and bool(config.repo_url),
+        dirty=dirty_since is not None,
+        dirty_since=dirty_since,
+    )
 
 
 @router.post(
@@ -613,13 +637,14 @@ async def git_fetch(
     ctx: Context,
     user: CurrentSuperuser,
     db: DbSession,
+    request: GitOpRequest | None = None,
 ) -> GitJobResponse:
     """Queue a git fetch operation."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -647,7 +672,7 @@ async def git_commit(
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = request.job_id or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -660,55 +685,57 @@ async def git_commit(
 
 
 @router.post(
-    "/pull",
+    "/sync",
     response_model=GitJobResponse,
-    summary="Queue git pull",
-    description="Queue a git pull operation.",
+    summary="Queue sync (pull + push)",
+    description="Queue a combined sync: pull remote changes, push local commits, import entities. Results via WebSocket.",
 )
-async def git_pull(
+async def git_sync(
     ctx: Context,
     user: CurrentSuperuser,
     db: DbSession,
+    request: GitOpRequest | None = None,
 ) -> GitJobResponse:
-    """Queue a git pull."""
+    """Queue a sync (pull + push + entity import)."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
         user_id=str(user.user_id),
         user_email=user.email,
-        op_type="git_pull",
+        op_type="git_sync",
     )
     return GitJobResponse(job_id=job_id)
 
 
 @router.post(
-    "/push",
+    "/abort-merge",
     response_model=GitJobResponse,
-    summary="Queue git push",
-    description="Queue a git push operation.",
+    summary="Abort merge",
+    description="Abort an in-progress merge, returning to pre-pull state.",
 )
-async def git_push(
+async def git_abort_merge(
     ctx: Context,
     user: CurrentSuperuser,
     db: DbSession,
+    request: GitOpRequest | None = None,
 ) -> GitJobResponse:
-    """Queue a git push."""
+    """Queue a merge abort."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
         user_id=str(user.user_id),
         user_email=user.email,
-        op_type="git_push",
+        op_type="git_abort_merge",
     )
     return GitJobResponse(job_id=job_id)
 
@@ -723,13 +750,14 @@ async def git_changes(
     ctx: Context,
     user: CurrentSuperuser,
     db: DbSession,
+    request: GitOpRequest | None = None,
 ) -> GitJobResponse:
     """Queue a working tree status check."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -757,7 +785,7 @@ async def git_resolve(
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = request.job_id or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -786,7 +814,7 @@ async def git_diff(
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = request.job_id or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -815,7 +843,7 @@ async def git_discard(
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = str(uuid.uuid4())
+    job_id = request.job_id or str(uuid.uuid4())
     await publish_git_operation(
         job_id=job_id,
         org_id=str(ctx.org_id) if ctx.org_id else "",
@@ -827,58 +855,3 @@ async def git_discard(
     return GitJobResponse(job_id=job_id)
 
 
-@router.get(
-    "/sync",
-    response_model=GitJobResponse,
-    summary="Queue sync preview",
-    description="Queue a sync preview operation. Fetches remote, computes diff, runs preflight. Results via WebSocket/polling.",
-)
-async def sync_preview(
-    ctx: Context,
-    user: CurrentSuperuser,
-    db: DbSession,
-) -> GitJobResponse:
-    """Queue a sync preview (fetch + status + preflight)."""
-    config = await get_github_config(db, ctx.org_id)
-    if not config or not config.token or not config.repo_url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
-
-    job_id = str(uuid.uuid4())
-    await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_sync_preview",
-    )
-    return GitJobResponse(job_id=job_id)
-
-
-@router.post(
-    "/sync",
-    response_model=GitJobResponse,
-    summary="Queue sync execution",
-    description="Queue a full sync: commit local changes, pull remote (with conflict resolutions), push. Results via WebSocket/polling.",
-)
-async def sync_execute(
-    request: SyncExecuteRequest,
-    ctx: Context,
-    user: CurrentSuperuser,
-    db: DbSession,
-) -> GitJobResponse:
-    """Queue a full sync (commit + pull + push)."""
-    config = await get_github_config(db, ctx.org_id)
-    if not config or not config.token or not config.repo_url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
-
-    job_id = str(uuid.uuid4())
-    await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_sync_execute",
-        conflict_resolutions=request.conflict_resolutions,
-        confirm_orphans=request.confirm_orphans,
-    )
-    return GitJobResponse(job_id=job_id)

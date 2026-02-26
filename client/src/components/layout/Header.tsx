@@ -29,6 +29,7 @@ import { NotificationCenter } from "@/components/layout/NotificationCenter";
 import { useProfile } from "@/hooks/useProfile";
 import { profileService } from "@/services/profile";
 import { webSocketService } from "@/services/websocket";
+import { FileActivityIndicator } from "@/components/layout/FileActivityIndicator";
 import { cn } from "@/lib/utils";
 
 interface HeaderProps {
@@ -148,6 +149,9 @@ export function Header({
 				{/* Spacer */}
 				<div className="flex-1" />
 
+				{/* File Activity Indicator (Platform Admin only) */}
+				{isPlatformAdmin && <FileActivityIndicator />}
+
 				{/* Search Button */}
 				<Button
 					variant="ghost"
@@ -197,7 +201,7 @@ export function Header({
 					</Button>
 				)}
 
-				{/* Notification Center */}
+					{/* Notification Center */}
 				<div className="mr-2">
 					<NotificationCenter />
 				</div>

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .client import get_client
-from .models import TableInfo, DocumentData, DocumentList
+from .client import get_client, raise_for_status_with_detail
+from .models import TableInfo, DocumentData, DocumentList, BatchResult, BatchDeleteResult
 from ._context import get_default_scope
 
 
@@ -99,7 +99,7 @@ class tables:
                 "app": app,
             }
         )
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return TableInfo.model_validate(response.json())
 
     @staticmethod
@@ -137,7 +137,7 @@ class tables:
                 "app": app,
             }
         )
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return [TableInfo.model_validate(t) for t in response.json()]
 
     @staticmethod
@@ -165,7 +165,7 @@ class tables:
         response = await client.delete(
             f"/api/tables/{table_id}",
         )
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return True
 
     # =========================================================================
@@ -224,7 +224,7 @@ class tables:
                 "app": app,
             }
         )
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return DocumentData.model_validate(response.json())
 
     @staticmethod
@@ -274,7 +274,7 @@ class tables:
                 "app": app,
             }
         )
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return DocumentData.model_validate(response.json())
 
     @staticmethod
@@ -316,7 +316,7 @@ class tables:
         )
         if response.status_code == 404:
             return None
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         data = response.json()
         if data is None:
             return None
@@ -364,7 +364,7 @@ class tables:
         )
         if response.status_code == 404:
             return None
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         result = response.json()
         if result is None:
             return None
@@ -409,8 +409,187 @@ class tables:
         )
         if response.status_code == 404:
             return False
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return True
+
+    # =========================================================================
+    # Batch Document Operations
+    # =========================================================================
+
+    @staticmethod
+    async def insert_batch(
+        table: str,
+        documents: list[dict[str, Any]],
+        scope: str | None = None,
+        app: str | None = None,
+    ) -> BatchResult:
+        """
+        Batch insert multiple documents into a table.
+
+        Auto-creates the table if it doesn't exist.
+        All documents are inserted atomically — if any ID conflicts, the entire batch rolls back.
+
+        Args:
+            table: Table name
+            documents: List of documents to insert. Each dict can be:
+                - A raw data dict (ID will be auto-generated)
+                - A dict with "id" and "data" keys for explicit ID control
+            scope: Organization scope
+            app: Application UUID
+
+        Returns:
+            BatchResult: Created documents and count
+
+        Raises:
+            RuntimeError: If not authenticated
+            HTTPError: If any document ID already exists (409 Conflict)
+            HTTPError: If more than 1000 documents (422)
+
+        Example:
+            >>> from bifrost import tables
+            >>> # Auto-generated IDs
+            >>> result = await tables.insert_batch("customers", [
+            ...     {"name": "Acme Corp", "status": "active"},
+            ...     {"name": "Beta Inc", "status": "pending"},
+            ... ])
+            >>> print(result.count)  # 2
+            >>>
+            >>> # Explicit IDs
+            >>> result = await tables.insert_batch("customers", [
+            ...     {"id": "acme-001", "data": {"name": "Acme Corp"}},
+            ...     {"id": "beta-001", "data": {"name": "Beta Inc"}},
+            ... ])
+        """
+        client = get_client()
+        effective_scope = _resolve_scope(scope)
+
+        # Normalize items: if no "data" key, the entire dict becomes the data
+        items = []
+        for doc in documents:
+            if "data" in doc and isinstance(doc["data"], dict):
+                items.append({"id": doc.get("id"), "data": doc["data"]})
+            else:
+                items.append({"id": None, "data": doc})
+
+        response = await client.post(
+            "/api/cli/tables/documents/insert/batch",
+            json={
+                "table": table,
+                "documents": items,
+                "scope": effective_scope,
+                "app": app,
+            }
+        )
+        raise_for_status_with_detail(response)
+        body = response.json()
+        return BatchResult(
+            documents=[DocumentData.model_validate(d) for d in body["documents"]],
+            count=body["count"],
+        )
+
+    @staticmethod
+    async def upsert_batch(
+        table: str,
+        documents: list[dict[str, Any]],
+        scope: str | None = None,
+        app: str | None = None,
+    ) -> BatchResult:
+        """
+        Batch upsert (create or replace) multiple documents.
+
+        Auto-creates the table if it doesn't exist.
+        Each document must have an "id" and "data" key.
+
+        Args:
+            table: Table name
+            documents: List of dicts, each with "id" (str) and "data" (dict) keys
+            scope: Organization scope
+            app: Application UUID
+
+        Returns:
+            BatchResult: Created/updated documents and count
+
+        Raises:
+            RuntimeError: If not authenticated
+            HTTPError: If more than 1000 documents (422)
+
+        Example:
+            >>> from bifrost import tables
+            >>> result = await tables.upsert_batch("employees", [
+            ...     {"id": "john@co.com", "data": {"name": "John", "dept": "Eng"}},
+            ...     {"id": "jane@co.com", "data": {"name": "Jane", "dept": "Sales"}},
+            ... ])
+            >>> print(result.count)  # 2
+        """
+        client = get_client()
+        effective_scope = _resolve_scope(scope)
+
+        items = [{"id": doc["id"], "data": doc["data"]} for doc in documents]
+
+        response = await client.post(
+            "/api/cli/tables/documents/upsert/batch",
+            json={
+                "table": table,
+                "documents": items,
+                "scope": effective_scope,
+                "app": app,
+            }
+        )
+        raise_for_status_with_detail(response)
+        body = response.json()
+        return BatchResult(
+            documents=[DocumentData.model_validate(d) for d in body["documents"]],
+            count=body["count"],
+        )
+
+    @staticmethod
+    async def delete_batch(
+        table: str,
+        doc_ids: list[str],
+        scope: str | None = None,
+        app: str | None = None,
+    ) -> BatchDeleteResult:
+        """
+        Batch delete multiple documents by ID.
+
+        Non-existent IDs are silently skipped.
+
+        Args:
+            table: Table name
+            doc_ids: List of document IDs to delete
+            scope: Organization scope
+            app: Application UUID
+
+        Returns:
+            BatchDeleteResult: Deleted IDs and count
+
+        Raises:
+            RuntimeError: If not authenticated
+            HTTPError: If more than 1000 IDs (422)
+
+        Example:
+            >>> from bifrost import tables
+            >>> result = await tables.delete_batch("customers", ["acme-001", "beta-001"])
+            >>> print(result.count)  # 2
+            >>> print(result.deleted_ids)  # ["acme-001", "beta-001"]
+        """
+        client = get_client()
+        effective_scope = _resolve_scope(scope)
+        response = await client.post(
+            "/api/cli/tables/documents/delete/batch",
+            json={
+                "table": table,
+                "doc_ids": doc_ids,
+                "scope": effective_scope,
+                "app": app,
+            }
+        )
+        raise_for_status_with_detail(response)
+        body = response.json()
+        return BatchDeleteResult(
+            deleted_ids=body["deleted_ids"],
+            count=body["count"],
+        )
 
     @staticmethod
     async def query(
@@ -485,7 +664,7 @@ class tables:
         # Return empty result if table doesn't exist
         if response.status_code == 404:
             return DocumentList(documents=[], total=0, limit=limit, offset=offset)
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return DocumentList.model_validate(response.json())
 
     @staticmethod
@@ -536,5 +715,5 @@ class tables:
         # Return 0 if table doesn't exist
         if response.status_code == 404:
             return 0
-        response.raise_for_status()
+        raise_for_status_with_detail(response)
         return response.json()
